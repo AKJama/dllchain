@@ -475,6 +475,7 @@ fn rename_changes_only_the_name() {
     let r = name(&c, "xhl-core.dll");
     assert_eq!(r.name, "Extra HUD Lines");
     assert!(!r.at.is_empty());
+    assert_eq!(r.page.as_deref(), Some("https://www.nexusmods.com/enshrouded/mods/1"));
     assert!(
         r.details.iter().any(|l| l == "Downloaded from https://www.nexusmods.com/enshrouded/mods/1"),
         "{:?}",

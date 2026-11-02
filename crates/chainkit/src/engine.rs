@@ -1176,6 +1176,8 @@ pub struct Row {
     pub source: String,
     pub sha: Option<String>,
     pub installed: bool,
+    /// The web page it was downloaded from, when Windows noted one.
+    pub page: Option<String>,
     /// Everything dllchain knows about it, one line each, for the details pane.
     pub details: Vec<String>,
 }
@@ -1253,6 +1255,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                 source,
                 sha,
                 installed: m.kind == Kind::Installed,
+                page: m.from_url.clone(),
                 details,
             };
         }
@@ -1283,7 +1286,18 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             Some(s) => details.push(format!("SHA-256: {s}")),
             None => details.push("The file is missing.".into()),
         }
-        Row { file: rel.clone(), word: None, name, role, at: String::new(), source, sha, installed: false, details }
+        Row {
+            file: rel.clone(),
+            word: None,
+            name,
+            role,
+            at: String::new(),
+            source,
+            sha,
+            installed: false,
+            page: None,
+            details,
+        }
     };
     if ctx.exists(&host) {
         let can = scan.host.as_ref().map(|(_, i)| i.can_host).unwrap_or(false);

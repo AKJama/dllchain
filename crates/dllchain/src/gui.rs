@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 mod common;
+mod update;
 
 use chainkit::engine::{Ctx, Plan, Row, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::hash::short;
@@ -53,9 +54,14 @@ const ID_REPAIR: i32 = 107;
 const ID_OPEN: i32 = 108;
 const ID_LOG: i32 = 109;
 const ID_RENAME: i32 = 110;
+const ID_PAGE: i32 = 111;
+const ID_CHECK_UPDATE: i32 = 201;
+const ID_ABOUT: i32 = 202;
 const WM_START: u32 = WM_APP + 1;
 /// A name typed into the list (`wp` 0), or a refused rename (`wp` 1), handled once the list's edit box is gone.
 const WM_RENAME: u32 = WM_APP + 2;
+/// The update check's answer, a `Box<update::Answer>` in `lp`.
+const WM_UPDATE: u32 = WM_APP + 3;
 
 #[derive(Clone, Copy)]
 struct Ctl {
@@ -65,7 +71,7 @@ struct Ctl {
     change: HWND,
     list_label: HWND,
     list: HWND,
-    buttons: [HWND; 6],
+    buttons: [HWND; 7],
     log: HWND,
     font: HFONT,
 }
@@ -180,7 +186,8 @@ fn create_controls(main: HWND) {
         buttons: [
             button("&Install mod...", ID_INSTALL),
             button("Re&name", ID_RENAME),
-            button("&Uninstall selected", ID_UNINSTALL),
+            button("Mod &page", ID_PAGE),
+            button("&Uninstall", ID_UNINSTALL),
             button("Uninstall &all", ID_UNINSTALL_ALL),
             button("&Repair", ID_REPAIR),
             button("&Open game folder", ID_OPEN),
@@ -315,7 +322,10 @@ fn selected() -> Option<Row> {
 
 /// The selected mod's details, or the messages when none is selected.
 fn show_selection() {
-    match selected() {
+    let r = selected();
+    // SAFETY: our button.
+    unsafe { EnableWindow(ctl().buttons[2], r.as_ref().is_some_and(|r| r.page.is_some()) as i32) };
+    match r {
         Some(r) => {
             let mut t = r.details.join("\n");
             if r.word.is_some() {
@@ -412,7 +422,8 @@ fn refresh(msg: &str) {
     let has_installed = rows.iter().any(|r| r.installed);
     let has_listed = rows.iter().any(|r| r.word.is_some());
     let has_game = o.game_dir().is_ok();
-    let on = [has_game, has_listed, has_installed, has_installed, can_repair, has_game];
+    // Mod page follows the selection, which a refresh clears
+    let on = [has_game, has_listed, false, has_installed, has_installed, can_repair, has_game];
     for (b, on) in c.buttons.iter().zip(on) {
         // SAFETY: our button.
         unsafe { EnableWindow(*b, on as i32) };
@@ -555,6 +566,24 @@ fn on_command(id: i32, code: u32) {
             }
         }
         (ID_RENAME, BN_CLICKED) => rename_selected(),
+        (ID_PAGE, BN_CLICKED) => {
+            // the record keeps only cleaned http(s) addresses, so this opens a web page in the browser
+            if let Some(page) = selected().and_then(|r| r.page) {
+                open_web(&page);
+            }
+        }
+        (ID_CHECK_UPDATE, _) => check_update(),
+        (ID_ABOUT, _) => {
+            message(
+                "About dllchain",
+                &format!(
+                    "dllchain {}\nInstalls several dinput8.dll mods side by side, and takes them out again.\n\n\
+                     https://github.com/AKJama/dllchain\nMIT licence.",
+                    update::THIS
+                ),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
         (ID_UNINSTALL, BN_CLICKED) => uninstall_selected(),
         (ID_UNINSTALL_ALL, BN_CLICKED) => act(Action::Uninstall(None)),
         (ID_REPAIR, BN_CLICKED) => act(Action::Repair),
@@ -566,6 +595,48 @@ fn on_command(id: i32, code: u32) {
             }
         }
         _ => {}
+    }
+}
+
+fn open_web(url: &str) {
+    let (verb, url) = (wide("open"), wide(url));
+    // SAFETY: opens the address in the default browser; the strings outlive the call.
+    unsafe { ShellExecuteW(ctl().main, verb.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL) };
+}
+
+/// Asks GitHub for the newest version on another thread, so the window keeps working; the answer comes back as
+/// WM_UPDATE.
+fn check_update() {
+    show("Asking GitHub for the newest version of dllchain...");
+    let main = ctl().main as usize;
+    std::thread::spawn(move || {
+        let found = Box::into_raw(Box::new(update::check()));
+        // SAFETY: the window takes the box back in WM_UPDATE; if the window is gone, the post fails and the box is
+        // freed here.
+        unsafe {
+            if PostMessageW(main as HWND, WM_UPDATE, 0, found as isize) == 0 {
+                drop(Box::from_raw(found));
+            }
+        }
+    });
+}
+
+fn update_found(found: update::Answer) {
+    show_selection();
+    let text = update::describe(&found);
+    match found {
+        Ok(update::Found::Newer(_, page)) => {
+            let ask = format!("{text}\n\nOpen the download page?");
+            if message("dllchain", &ask, MB_YESNO | MB_ICONINFORMATION) == IDYES {
+                open_web(&page);
+            }
+        }
+        Ok(update::Found::UpToDate) => {
+            message("dllchain", &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Err(_) => {
+            message("dllchain", &text, MB_OK | MB_ICONWARNING);
+        }
     }
 }
 
@@ -739,6 +810,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let h = unsafe { &*(lp as *const NMHDR) };
             if h.hwndFrom == ctl().list { on_list_notify(hwnd, h.code, lp) } else { 0 }
         }
+        WM_UPDATE => {
+            // SAFETY: the box check_update's thread posted, taken back once.
+            let found = unsafe { Box::from_raw(lp as *mut update::Answer) };
+            update_found(*found);
+            0
+        }
         WM_RENAME => {
             if wp == 1 {
                 if let Some(r) = selected() {
@@ -824,6 +901,11 @@ fn main() {
         };
         RegisterClassExW(&wc);
         let title = wide(&format!("dllchain - {} dinput8.dll mods", GAME.name));
+        let (help, bar) = (CreatePopupMenu(), CreateMenu());
+        let (check, about, help_title) = (wide("Check for &updates..."), wide("&About dllchain"), wide("&Help"));
+        AppendMenuW(help, MF_STRING, ID_CHECK_UPDATE as usize, check.as_ptr());
+        AppendMenuW(help, MF_STRING, ID_ABOUT as usize, about.as_ptr());
+        AppendMenuW(bar, MF_POPUP, help as usize, help_title.as_ptr());
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
@@ -834,7 +916,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             null_mut(),
-            null_mut(),
+            bar,
             inst,
             null(),
         );

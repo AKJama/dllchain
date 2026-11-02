@@ -1,6 +1,7 @@
 //! dllchain-cli: the window's actions on the command line. Without `--yes` it only shows what it would change.
 
 mod common;
+mod update;
 
 use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::hash::short;
@@ -17,6 +18,7 @@ dllchain-cli: installs several dinput8.dll mods side by side, and takes them out
   dllchain-cli uninstall <name> | --all [--yes]
   dllchain-cli rename <name> <new name> [--yes]   (\"\" gives the mod its own name back)
   dllchain-cli repair [--yes]
+  dllchain-cli check-update   (asks GitHub for the newest version; nothing else is sent)
 
   <name> is the mod's file-name word, as `status` shows it (\"enstash\", \"auto-loot-plus\").
 
@@ -33,6 +35,7 @@ enum Cmd {
     Uninstall(Option<String>),
     Rename(String, String),
     Repair,
+    CheckUpdate,
 }
 
 struct Args {
@@ -66,6 +69,7 @@ fn parse(args: Vec<String>) -> std::result::Result<Args, String> {
     let cmd = match (free.first().map(String::as_str), free.len(), all) {
         (Some("status"), 1, false) => Cmd::Status,
         (Some("repair"), 1, false) => Cmd::Repair,
+        (Some("check-update"), 1, false) => Cmd::CheckUpdate,
         (Some("install"), 2, false) => Cmd::Install(PathBuf::from(&free[1])),
         (Some("uninstall"), 2, false) => Cmd::Uninstall(Some(free[1].clone())),
         (Some("uninstall"), 1, true) => Cmd::Uninstall(None),
@@ -82,6 +86,18 @@ enum Outcome {
 }
 
 fn run(a: &Args) -> Result<Outcome> {
+    // needs no game folder
+    if let Cmd::CheckUpdate = a.cmd {
+        let found = update::check();
+        if found.is_err() {
+            return Err(Error(update::describe(&found)));
+        }
+        println!("{}", update::describe(&found));
+        if let Ok(update::Found::Newer(_, page)) = &found {
+            println!("Download page: {page}");
+        }
+        return Ok(Outcome::Done);
+    }
     let (ctx, recovered) = a.opts.open()?;
     println!("{} folder: {}", GAME.name, shown(&ctx.dir));
     for n in recovered {
@@ -101,6 +117,7 @@ fn run(a: &Args) -> Result<Outcome> {
         Cmd::Uninstall(w) => plan_uninstall(&ctx, w.as_deref())?,
         Cmd::Rename(w, n) => plan_rename(&ctx, w, Some(n))?,
         Cmd::Repair => plan_repair(&ctx)?,
+        Cmd::CheckUpdate => unreachable!("handled above"),
     };
     print!("\n{}", describe(&plan));
     if plan.is_empty() {

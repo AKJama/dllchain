@@ -15,9 +15,13 @@ Download the zip from the [releases](https://github.com/AKJama/dllchain/releases
 Close the game and Steam first; dllchain changes nothing while either runs.
 
 - **Install mod...** (or drop a mod's `.zip` or `dinput8.dll` on the window) adds a mod.
-- **Uninstall selected** or **Uninstall all** take mods out again.
+- **Uninstall** or **Uninstall all** take mods out again.
 - **Repair** fixes the chain after another mod's `dinput8.dll` was copied over a chained one.
 - **Rename** (or F2) changes the name a mod is shown under; no file is renamed.
+- **Mod page** opens the page the selected mod was downloaded from, when Windows noted one.
+  To update a mod, download the new zip there and install it over the old one: it keeps its place in the chain, and uninstalling still gives back what was there before.
+- **Help > Check for updates** asks GitHub whether a newer dllchain is out and offers to open its page.
+  dllchain never downloads or installs anything by itself.
 - Select a mod to see everything dllchain knows about it: when it was installed, from which file and website, its SHA-256 and the files it added.
 
 Every change is shown first and only made after you press OK.
@@ -29,6 +33,7 @@ dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
 dllchain-cli uninstall <name> | --all [--yes]
 dllchain-cli rename <name> <new name> [--yes]
 dllchain-cli repair [--yes]
+dllchain-cli check-update
 ```
 
 Without `--yes` it only shows what it would do.
@@ -42,8 +47,10 @@ Without `--yes` it only shows what it would do.
 - What it installed is listed in `dllchain\record.txt`, and each run is logged in `dllchain\installer.log`.
 - When the mod was downloaded with a browser, the website it came from is noted too (Windows keeps that with every download).
   Only the site and page are kept, never the part after `?`, which can hold your account id or a download key.
-  It stays in the game folder; dllchain sends nothing anywhere.
+  It stays in the game folder.
 - Before the first install it copies your saves once to `%LOCALAPPDATA%\dllchain\save-backups`.
+
+dllchain sends nothing anywhere, except when you check for updates: then it asks GitHub for the newest version number, and nothing about your PC or game goes with it.
 
 It never writes programs (`.exe`), game data, Steam's files or another loader's folder, and never writes outside the game folder (apart from that one save copy).
 Uninstall removes only what dllchain created, and gives back the rest byte for byte.
