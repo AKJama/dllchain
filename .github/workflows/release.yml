@@ -28,9 +28,10 @@ jobs:
           Compress-Archive -Path dist/$name/* -DestinationPath dist/$name.zip
           Copy-Item target/release/dllchain.exe, target/release/dllchain-cli.exe dist
           Push-Location dist
-          Get-ChildItem "$name.zip", dllchain.exe, dllchain-cli.exe |
-            ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name } |
-            Set-Content -Encoding ascii SHA256SUMS.txt
+          # Unix line ends, so `sha256sum -c SHA256SUMS.txt` reads it on any system
+          $sums = Get-ChildItem "$name.zip", dllchain.exe, dllchain-cli.exe |
+            ForEach-Object { "{0}  {1}`n" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name }
+          [IO.File]::WriteAllText("$PWD/SHA256SUMS.txt", -join $sums)
           Get-Content SHA256SUMS.txt
           Pop-Location
       - uses: actions/attest-build-provenance@v4
