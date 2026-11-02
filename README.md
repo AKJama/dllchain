@@ -21,6 +21,7 @@ Close the game and Steam first; dllchain changes nothing while either runs.
   It installs the mod anyway and never downloads EML itself.
 - **Uninstall** or **Uninstall all** take mods out again.
 - **Repair** fixes the chain after another mod's `dinput8.dll` was copied over a chained one.
+  A chained mod you replaced by hand with a newer build of the same mod is kept, not put back: dllchain keeps a copy of your build from then on.
 - **Rename** (or F2) changes the name a mod is shown under; no file is renamed.
 - **Mod page** opens the page the selected mod was downloaded from, when Windows noted one.
   To update a mod, download the new zip there and install it over the old one: it keeps its place in the chain, and uninstalling still gives back what was there before.
