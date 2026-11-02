@@ -100,6 +100,9 @@ pub fn describe(plan: &Plan) -> String {
             s.push_str(&format!("  - {l}\n"));
         }
     }
+    for r in &plan.missing {
+        s.push_str(&format!("\n{}\n{}'s page: {}\n", r.line(), r.short, r.page));
+    }
     if !plan.notes.is_empty() {
         s.push_str("\nGood to know:\n");
         for n in &plan.notes {

@@ -32,8 +32,8 @@ use windows_sys::Win32::UI::Controls::{
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW, LVN_ITEMCHANGED,
     LVNI_SELECTED, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS,
     LVS_SINGLESEL, NM_DBLCLK, NMHDR, NMLISTVIEW, NMLVDISPINFOW, SetWindowTheme, ShowScrollBar, TASKDIALOG_BUTTON,
-    TASKDIALOGCONFIG, TD_WARNING_ICON, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-    TDF_POSITION_RELATIVE_TO_WINDOW, TaskDialogIndirect,
+    TASKDIALOGCONFIG, TD_WARNING_ICON, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_ENABLE_HYPERLINKS,
+    TDF_POSITION_RELATIVE_TO_WINDOW, TDN_HYPERLINK_CLICKED, TaskDialogIndirect,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -45,6 +45,7 @@ use windows_sys::Win32::UI::Shell::{
     FOLDERID_Downloads, HDROP, SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::core::HRESULT;
 
 const ID_GAME: i32 = 101;
 const ID_CHANGE: i32 = 102;
@@ -502,7 +503,11 @@ fn act(a: Action) {
             Action::Uninstall(None) => "Every mod dllchain installed is uninstalled.".to_string(),
             _ => "Your mods are repaired.".to_string(),
         };
-        out.push_str(&format!("{intro}Done: {done}\n\nFiles that changed:\n"));
+        out.push_str(&format!("{intro}Done: {done}\n"));
+        for r in &plan.missing {
+            out.push_str(&format!("{}\n{}'s page: {}\n", r.line(), r.short, r.page));
+        }
+        out.push_str("\nFiles that changed:\n");
         for f in &plan.files {
             out.push_str(&format!("{f}\n"));
         }
@@ -544,14 +549,20 @@ fn sentence(n: &str) -> String {
 /// that change and how many more. True when the player said yes.
 fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
     let (verb, question) = question(a, plan);
+    // with links on, a "<a" in a mod's name or file would be a link too
+    let links = !plan.missing.is_empty();
+    let plain = |s: &str| if links { s.replace('<', "\u{2039}") } else { s.to_string() };
     let mut content = String::new();
     for l in &plan.summary {
-        content.push_str(&format!("{l}\n"));
+        content.push_str(&format!("{}\n", plain(l)));
+    }
+    for r in &plan.missing {
+        content.push_str(&format!("\n{}\n<a href=\"{}\">{}'s page</a>\n", r.line(), r.page, r.short));
     }
     if !plan.notes.is_empty() {
         content.push('\n');
         for n in plan.notes.iter().take(MAX_NOTES) {
-            content.push_str(&format!("{}\n", sentence(n)));
+            content.push_str(&format!("{}\n", plain(&sentence(n))));
         }
         if plan.notes.len() > MAX_NOTES {
             content.push_str(&format!("{} more notes are under Show details.\n", plan.notes.len() - MAX_NOTES));
@@ -585,7 +596,7 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
         ));
     }
     let (title, main, text, more) =
-        (wide("dllchain"), wide(&question), wide(&crlf(content.trim_end())), wide(&crlf(details.trim_end())));
+        (wide("dllchain"), wide(&question), wide(&crlf(content.trim_end())), wide(&crlf(&plain(details.trim_end()))));
     let (show, hide, go) = (wide("Show details"), wide("Hide details"), wide(&format!("&{verb}")));
     const ID_GO: i32 = 100;
     let buttons = [TASKDIALOG_BUTTON { nButtonID: ID_GO, pszButtonText: go.as_ptr() }];
@@ -596,6 +607,10 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
         tc.cbSize = size_of::<TASKDIALOGCONFIG>() as u32;
         tc.hwndParent = ctl().main;
         tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+        if links {
+            tc.dwFlags |= TDF_ENABLE_HYPERLINKS;
+            tc.pfCallback = Some(on_link);
+        }
         tc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
         tc.pszWindowTitle = title.as_ptr();
         if !plan.replaces.is_empty() {
@@ -612,6 +627,22 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
         TaskDialogIndirect(&tc, &mut pressed, null_mut(), null_mut())
     };
     ok == 0 && pressed == ID_GO
+}
+
+/// A link in the question was clicked: opens it when it is a requirement's page, nothing else.
+unsafe extern "system" fn on_link(_: HWND, msg: u32, _: WPARAM, lp: LPARAM, _: isize) -> HRESULT {
+    if msg == TDN_HYPERLINK_CLICKED as u32 && lp != 0 {
+        let p = lp as *const u16;
+        // SAFETY: for this notification `lp` is the link's NUL-terminated href, valid during the call.
+        let href = unsafe {
+            let n = (0..).take_while(|&i| *p.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
+        };
+        if let Some(r) = GAME.requirements.iter().find(|r| r.page == href) {
+            open_web(r.page);
+        }
+    }
+    0
 }
 
 /// The player's Downloads folder, where a mod usually is.

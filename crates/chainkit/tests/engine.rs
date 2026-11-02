@@ -598,3 +598,52 @@ fn a_mod_with_hundreds_of_files_still_gets_a_few_lines() {
     assert_eq!(std::fs::read(dir.join(r"mods\big\old-0.txt")).unwrap(), b"theirs");
     clean(&dir);
 }
+
+/// The missing requirements' lines, and the status details of the installed `word` that are notes.
+fn needs(c: &Ctx, p: &Plan, word: &str) -> (Vec<String>, Vec<String>) {
+    let shown = status(c).unwrap();
+    let row = shown.rows.iter().find(|r| r.word.as_deref() == Some(word)).unwrap();
+    let notes = row.details.iter().filter(|(l, _)| l == "Note").map(|(_, v)| v.clone()).collect();
+    (p.missing.iter().map(|r| r.line()).collect(), notes)
+}
+
+#[test]
+fn an_eml_package_warns_only_while_eml_is_missing() {
+    let warning = "This mod also needs the Enshrouded Mod Loader (EML), which isn't installed. Parts of it won't work \
+                   until you install EML.";
+    let package: &[(&str, &[u8])] =
+        &[(r"mods\auto-loot-plus\mod.json", b"{}"), (r"mods\auto-loot-plus\src\mod.lua", b"")];
+
+    // without EML: a warning, and the install still goes ahead
+    let dir = game("eml-missing");
+    let c = ctx(&dir);
+    let p = install(&c, &src("AutoLootPlus.zip", alp(), package));
+    assert_eq!(needs(&c, &p, "auto-loot-plus"), (vec![warning.to_string()], vec![warning.to_string()]));
+    assert!(dir.join(r"mods\auto-loot-plus\mod.json").exists());
+
+    // EML as dbghelp.dll, or chained as a guest of the host: no warning
+    let eml = fake_dll(&["EML_LOG_FILE_PATH"], None);
+    for (name, at) in [("eml-dbghelp", "dbghelp.dll"), ("eml-guest", "eml.dll")] {
+        let dir = game(name);
+        std::fs::write(dir.join(at), &eml).unwrap();
+        if at == "eml.dll" {
+            std::fs::write(dir.join("dinput8-chain.ini"), "eml.dll\r\n").unwrap();
+        }
+        let c = ctx(&dir);
+        let p = install(&c, &src("AutoLootPlus.zip", alp(), package));
+        assert_eq!(needs(&c, &p, "auto-loot-plus"), (vec![], vec![]), "{name}");
+    }
+
+    // a switched-off EML does not run
+    let dir = game("eml-off");
+    std::fs::write(dir.join("eml.dll"), &eml).unwrap();
+    std::fs::write(dir.join("dinput8-chain.ini"), "; eml.dll\r\n").unwrap();
+    let c = ctx(&dir);
+    assert_eq!(plan_install(&c, &src("AutoLootPlus.zip", alp(), package)).unwrap().missing.len(), 1);
+
+    // no mods\ folder, or a mod.json that is not an EML package's: nothing to say
+    let dir = game("no-package");
+    let c = ctx(&dir);
+    let p = install(&c, &src("Shiny.zip", shiny(), &[("shiny.txt", b"settings"), (r"mods\mod.json", b"{}")]));
+    assert_eq!(needs(&c, &p, "shiny-mod"), (vec![], vec![]));
+}

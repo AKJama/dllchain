@@ -17,6 +17,8 @@ Close the game and Steam first; dllchain changes nothing while either runs.
 - **Install mod...** (or drop a mod's `.zip` or `dinput8.dll` on the window) adds a mod.
   For a mod you already unpacked, pick its `dinput8.dll`: the files next to it (such as its `mods\` folder) are installed with it.
   A folder that also holds programs or other archives, such as Downloads itself, is refused, so unpack each mod into a folder of its own.
+  When the mod is also a script package for the [Enshrouded Mod Loader (EML)](https://brabb3l.github.io/kfc-parser/eml/usage.html) (it ships `mods\<name>\mod.json`) and EML is not installed, dllchain says so, with a link to EML's page.
+  It installs the mod anyway and never downloads EML itself.
 - **Uninstall** or **Uninstall all** take mods out again.
 - **Repair** fixes the chain after another mod's `dinput8.dll` was copied over a chained one.
 - **Rename** (or F2) changes the name a mod is shown under; no file is renamed.

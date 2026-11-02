@@ -7,8 +7,8 @@
 //! So the result is the same whatever order mods come in.
 
 use crate::chainini::{AddResult, ChainFile, Parsed};
-use crate::dllinfo::{DllInfo, WordFrom, inspect};
-use crate::game::Game;
+use crate::dllinfo::{DllInfo, WordFrom, contains_text, inspect};
+use crate::game::{Game, Requirement};
 use crate::hash::{sha256_hex, short};
 use crate::paths::{RelPath, is_word, resolve};
 use crate::record::{FileRec, Kind, ModRec, RECORD, Record, clean_name, store_rel};
@@ -92,6 +92,8 @@ pub struct Plan {
     pub name: String,
     /// Every file in the game folder the run changes, one line each ("mods\a\b.txt (new)"), for the details.
     pub files: Vec<String>,
+    /// What the mod being installed needs and the game folder does not have: a warning, never a reason to refuse.
+    pub missing: Vec<&'static Requirement>,
     steps: Vec<Step>,
     record: Record,
     /// Files as they must be after the run (`None`: not there).
@@ -188,6 +190,25 @@ fn scan(ctx: &Ctx) -> Result<Scan> {
         ));
     }
     Ok(Scan { record, notes, chain, parsed, host })
+}
+
+/// What a mod with these files needs and the game folder does not have. Only DLLs the game loads count: the host,
+/// the chain's switched-on entries and the other proxy names.
+fn missing(ctx: &Ctx, scan: &Scan, files: &[&RelPath]) -> Vec<&'static Requirement> {
+    let needed: Vec<&'static Requirement> =
+        ctx.game.requirements.iter().filter(|r| r.needed_by(files.iter().copied())).collect();
+    if needed.is_empty() {
+        return needed;
+    }
+    let mut loaded = vec![ctx.host()];
+    let others = ctx.game.proxy_names.iter().map(|p| RelPath::of(&format!("{p}.dll")));
+    for rel in scan.parsed.on().map(|e| e.name.clone()).chain(others) {
+        if !loaded.iter().any(|l| l.same(&rel)) {
+            loaded.push(rel);
+        }
+    }
+    let dlls: Vec<Vec<u8>> = loaded.iter().filter_map(|r| ctx.read(r)).collect();
+    needed.into_iter().filter(|r| !dlls.iter().any(|b| r.texts.iter().any(|t| contains_text(b, t)))).collect()
 }
 
 /// Leaves out what the record may not point at, whoever wrote it: a mod's DLL is a `.dll` next to the game that the
@@ -779,6 +800,8 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     for i in &src.ignored {
         w.plan.notes.push(format!("{i} is outside the mod's folder in the zip, so it is not installed"));
     }
+    let files: Vec<&RelPath> = src.files.iter().map(|(r, _)| r).collect();
+    w.plan.missing = missing(ctx, &scan, &files);
     Ok(w.finish())
 }
 
@@ -1394,6 +1417,10 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                     _ => continue,
                 };
                 details.push(pair("", format!("{} ({state})", f.rel)));
+            }
+            for r in missing(ctx, &scan, &rels) {
+                details.push(pair("Note", r.line()));
+                details.push(pair("", format!("{}'s page: {}", r.short, r.page)));
             }
             details.push(pair("SHA-256", m.dll_sha.clone()));
             if m.source_sha != "-" && m.source_sha != m.dll_sha {
