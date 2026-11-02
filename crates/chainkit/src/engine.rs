@@ -121,6 +121,14 @@ struct Scan {
     parsed: Parsed,
     /// `dinput8.dll` now, with what it is.
     host: Option<(Vec<u8>, DllInfo)>,
+    /// Guests replaced by hand with another build of the same mod: (word, the file's bytes, what it is).
+    rebuilt: Vec<(String, Vec<u8>, DllInfo)>,
+}
+
+impl Scan {
+    fn rebuilt(&self, word: &str) -> Option<&(String, Vec<u8>, DllInfo)> {
+        self.rebuilt.iter().find(|r| r.0 == word)
+    }
 }
 
 fn scan(ctx: &Ctx) -> Result<Scan> {
@@ -189,7 +197,34 @@ fn scan(ctx: &Ctx) -> Result<Scan> {
             r.why
         ));
     }
-    Ok(Scan { record, notes, chain, parsed, host })
+    let mut scan = Scan { record, notes, chain, parsed, host, rebuilt: Vec::new() };
+    scan.rebuilt = scan.record.mods.iter().filter_map(|m| rebuilt(ctx, &scan, m)).collect();
+    Ok(scan)
+}
+
+/// A guest's DLL that someone replaced by hand where dllchain left it, with a newer build of the same mod: dllchain
+/// takes it as that mod's DLL from now on instead of putting its own copy back. It must still be a 64-bit DLL, not
+/// EMF and not another mod on the list, and if it says which mod it is, that is this one. A missing file, or anything
+/// else in its place, is still repaired. (`dinput8.dll` itself is [`Work::adopt_host`]'s.)
+fn rebuilt(ctx: &Ctx, scan: &Scan, m: &ModRec) -> Option<(String, Vec<u8>, DllInfo)> {
+    if m.dll_at.same(&ctx.host()) || locate(ctx, scan, m).is_some() {
+        return None;
+    }
+    let bytes = ctx.read(&m.dll_at)?;
+    let info = inspect(&bytes, ctx.game).ok()?;
+    let same_mod = match &info.word {
+        None => true,
+        // a second copy of a mod is "<word>-2"
+        Some((w, _)) => {
+            m.word == *w
+                || m.word
+                    .strip_prefix(w.as_str())
+                    .and_then(|r| r.strip_prefix('-'))
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+        }
+    };
+    let theirs = scan.record.mods.iter().any(|o| o.dll_sha == info.sha256);
+    (same_mod && !info.is_emf && !theirs).then(|| (m.word.clone(), bytes, info))
 }
 
 /// What a mod with these files needs and the game folder does not have. Only DLLs the game loads count: the host,
@@ -287,6 +322,17 @@ impl<'a> Work<'a> {
             allow_no_host: false,
         };
         for m in &scan.record.mods {
+            if let Some((_, bytes, info)) = scan.rebuilt(&m.word) {
+                w.plan.summary.push(format!(
+                    "The {} in your game is not the copy dllchain kept, so dllchain keeps yours from now on.",
+                    name_of(ctx.game, m)
+                ));
+                let mut m = m.clone();
+                m.dll_sha = info.sha256.clone();
+                w.dlls.insert(m.word.clone(), bytes.clone());
+                w.mods.push(m);
+                continue;
+            }
             match load_dll(ctx, scan, m) {
                 Some(b) => {
                     w.dlls.insert(m.word.clone(), b);
@@ -412,7 +458,10 @@ impl<'a> Work<'a> {
             .map(|m| inspect(&self.dlls[&m.word], ctx.game).map(|i| i.can_host).unwrap_or(false))
             .collect();
         let located: Vec<Option<RelPath>> = self.mods.iter().map(|m| locate(ctx, self.scan, m)).collect();
-        let dropping = |r: &RelPath, drop: &[(RelPath, String)]| drop.iter().any(|(d, _)| d.same(r));
+        // a DLL of ours that goes before anything moves (only while it is still the one dllchain means)
+        let dropping = |r: &RelPath, drop: &[(RelPath, String)]| {
+            drop.iter().any(|(d, s)| d.same(r) && ctx.sha(r).as_deref() == Some(s.as_str()))
+        };
         let holder =
             (0..n).find(|&i| located[i].as_ref().is_some_and(|l| l.same(&host)) && !dropping(&host, &self.drop));
 
@@ -470,12 +519,13 @@ impl<'a> Work<'a> {
                     targets.iter().any(|t| t.same(r))
                         || r.same(&host)
                         || (ctx.exists(r) && ctx.sha(r).as_deref() != Some(sha.as_str()) && !dropping(r, &self.drop))
-                        || self
-                            .scan
-                            .parsed
-                            .entries
-                            .iter()
-                            .any(|e| e.name.same(r) && ctx.sha(r).as_deref() != Some(sha.as_str()))
+                        // someone else's line for a DLL that is not there (this mod's own line is not)
+                        || self.scan.parsed.entries.iter().any(|e| {
+                            e.name.same(r)
+                                && !r.same(&m.dll_at)
+                                && ctx.sha(r).as_deref() != Some(sha.as_str())
+                                && !dropping(r, &self.drop)
+                        })
                 };
                 match loc {
                     Some(l) if !l.same(&host) && !taken(l, &targets) => l.clone(),
@@ -556,8 +606,12 @@ impl<'a> Work<'a> {
                 self.plan.steps.push(Step::Write(t.clone(), self.dlls[&self.mods[i].word].clone()));
                 match self.scan.record.mods.iter().find(|m| m.word == self.mods[i].word) {
                     None => self.plan.summary.push(format!("{w} will be added to your game.")),
-                    Some(m) if m.dll_sha == sha => {
+                    // under another name when something else is where it was
+                    Some(m) if m.dll_sha == sha && m.dll_at.same(t) => {
                         self.plan.summary.push(format!("{w} is put back from dllchain's copy."))
+                    }
+                    Some(m) if m.dll_sha == sha => {
+                        self.plan.summary.push(format!("{w} is put back from dllchain's copy, as {t}."))
                     }
                     // a new version, which plan_install words
                     Some(_) => {}
@@ -687,9 +741,12 @@ impl<'a> Work<'a> {
                     renamed_away.push(a);
                     (0, a, format!("{a} renamed to {b}"))
                 }
-                // a file another one is renamed onto right after: the rename says it
+                // a file another one is renamed or written onto later: that step says it
                 Step::Delete(r)
-                    if !own(r) && !steps[i + 1..].iter().any(|s| matches!(s, Step::Rename(_, b) if b.same(r))) =>
+                    if !own(r)
+                        && !steps[i + 1..]
+                            .iter()
+                            .any(|s| matches!(s, Step::Rename(_, b) | Step::Write(b, _) if b.same(r))) =>
                 {
                     (1, r, format!("{r} (deleted)"))
                 }
@@ -745,8 +802,10 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
             }
             let mut r = old.clone();
             if old.kind == Kind::Adopted {
-                // installed by hand before; it comes back on uninstall
+                // installed by hand before; it comes back on uninstall, so its copy must be there
                 r.replaced_dll = Some(old.dll_sha.clone());
+                let b = w.dlls[&word].clone();
+                w.write_store(&word, &b);
                 r.kind = Kind::Installed;
             }
             r
@@ -1366,7 +1425,9 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         let sha = ctx.sha(rel);
         let pair = |label: &str, value: String| (label.to_string(), value);
         let mut details = vec![pair("File", format!("{rel} ({role})"))];
-        if let Some(m) = scan.record.mods.iter().find(|m| Some(&m.dll_sha) == sha.as_ref()) {
+        let rebuilt =
+            |m: &ModRec| m.dll_at.same(rel) && scan.rebuilt(&m.word).is_some_and(|r| Some(&r.2.sha256) == sha.as_ref());
+        if let Some(m) = scan.record.mods.iter().find(|m| Some(&m.dll_sha) == sha.as_ref() || rebuilt(m)) {
             let name = name_of(ctx.game, m);
             let folder = m.label.strip_suffix('\\');
             let source = match m.kind {
@@ -1422,7 +1483,11 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                 details.push(pair("Note", r.line()));
                 details.push(pair("", format!("{}'s page: {}", r.short, r.page)));
             }
-            details.push(pair("SHA-256", m.dll_sha.clone()));
+            if rebuilt(m) {
+                details.push(pair("Changed", "replaced by hand with another build since dllchain kept a copy".into()));
+                details.push(pair("", "a repair keeps yours and updates dllchain's copy".into()));
+            }
+            details.push(pair("SHA-256", sha.clone().unwrap_or_else(|| m.dll_sha.clone())));
             if m.source_sha != "-" && m.source_sha != m.dll_sha {
                 details.push(pair("Zip SHA-256", m.source_sha.clone()));
             }

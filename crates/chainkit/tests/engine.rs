@@ -211,6 +211,21 @@ fn update_keeps_the_players_changed_settings() {
 }
 
 #[test]
+fn an_updated_guest_keeps_its_file_name() {
+    let dir = game("guest-update");
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    install(&c, &src("xhl.zip", xhl(), &[]));
+    let xhl2 = fake_dll(&["version two"], Some("XHL Core"));
+    let p = install(&c, &src("xhl.zip", xhl2.clone(), &[]));
+    assert_eq!(p.files, vec!["xhl-core.dll (replaced)"]);
+    assert_eq!(read(&dir, "xhl-core.dll"), Some(xhl2));
+    assert!(!dir.join("xhl-core-2.dll").exists());
+    assert_eq!(chain(&dir), vec![("xhl-core.dll".to_string(), true)]);
+    assert!(plan_repair(&c).unwrap().is_empty());
+}
+
+#[test]
 fn installing_the_same_mod_twice_changes_nothing() {
     let dir = game("twice");
     let c = ctx(&dir);
@@ -457,6 +472,114 @@ fn a_mod_put_there_by_hand_needs_no_repair() {
     assert_eq!(r.source, "put there by hand");
     assert!(r.details.iter().any(|(_, v)| v.contains("joins the chain")), "{:?}", r.details);
     assert_eq!(snapshot(&dir), before);
+}
+
+fn enstash() -> Vec<u8> {
+    fake_dll(&["enstash Quick Stack"], None)
+}
+fn enstash2() -> Vec<u8> {
+    fake_dll(&["enstash Quick Stack", "a newer build"], None)
+}
+
+/// enstash was `dinput8.dll` first, so dllchain chained it (and kept a copy) when ALP came.
+fn enstash_chained(name: &str) -> (PathBuf, Ctx, BTreeMap<String, Vec<u8>>) {
+    let dir = game(name);
+    std::fs::write(dir.join("dinput8.dll"), enstash()).unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash()));
+    (dir, c, before)
+}
+
+fn store(dir: &Path, word: &str) -> Vec<String> {
+    let prefix = format!("dllchain\\mods\\{word}\\");
+    snapshot(dir)
+        .into_keys()
+        .filter_map(|k| k.strip_prefix(&prefix).filter(|f| !f.is_empty()).map(String::from))
+        .collect()
+}
+
+#[test]
+fn a_guest_replaced_by_hand_with_a_newer_build_is_kept() {
+    let (dir, c, before) = enstash_chained("rebuilt");
+    std::fs::write(dir.join("enstash.dll"), enstash2()).unwrap();
+    let st = status(&c).unwrap();
+    assert!(st.repair.iter().any(|l| l.contains("keeps yours")), "{:?}", st.repair);
+    assert!(st.repair.iter().all(|l| !l.contains("put back")), "{:?}", st.repair);
+    let row = st.rows.iter().find(|r| r.file == RelPath::of("enstash.dll")).unwrap();
+    assert_eq!(row.word.as_deref(), Some("enstash"));
+    assert!(row.details.iter().any(|(k, v)| k == "SHA-256" && *v == sha256_hex(&enstash2())), "{:?}", row.details);
+    assert!(row.details.iter().any(|(_, v)| v.contains("replaced by hand")), "{:?}", row.details);
+
+    let p = run(&c, plan_repair(&c));
+    clean(&dir);
+    assert!(p.files.is_empty(), "only dllchain's own files change: {:?}", p.files);
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash2()));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(chain(&dir), vec![("enstash.dll".to_string(), true)]);
+    assert_eq!(store(&dir, "enstash"), vec![format!("{}.dll", sha256_hex(&enstash2()))]);
+    assert!(plan_repair(&c).unwrap().is_empty());
+
+    // the newer build is what comes back as dinput8.dll
+    let mut expect = before;
+    expect.insert("dinput8.dll".into(), enstash2());
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(snapshot(&dir), expect);
+}
+
+#[test]
+fn a_newer_build_is_kept_by_any_run_not_only_a_repair() {
+    let (dir, c, _) = enstash_chained("rebuilt-uninstall");
+    std::fs::write(dir.join("enstash.dll"), enstash2()).unwrap();
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(enstash2()));
+    assert!(!dir.join("enstash.dll").exists());
+    assert!(!dir.join("dllchain").exists());
+}
+
+#[test]
+fn installing_over_a_rebuilt_mod_gives_the_rebuilt_one_back_on_uninstall() {
+    let (dir, c, _) = enstash_chained("rebuilt-install");
+    std::fs::write(dir.join("enstash.dll"), enstash2()).unwrap();
+    let v3 = fake_dll(&["enstash Quick Stack", "version three"], None);
+    install(&c, &src("enstash.zip", v3.clone(), &[]));
+    assert_eq!(read(&dir, "enstash.dll"), Some(v3));
+    run(&c, plan_uninstall(&c, Some("enstash")));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash2()));
+    assert!(plan_repair(&c).unwrap().is_empty());
+}
+
+#[test]
+fn a_guest_that_is_missing_broken_or_another_mod_is_still_repaired() {
+    for (i, what) in ["missing", "not a dll", "another mod"].iter().enumerate() {
+        let (dir, c, _) = enstash_chained(&format!("not-rebuilt{i}"));
+        match *what {
+            "missing" => std::fs::remove_file(dir.join("enstash.dll")).unwrap(),
+            "not a dll" => std::fs::write(dir.join("enstash.dll"), b"half a download").unwrap(),
+            _ => std::fs::write(dir.join("enstash.dll"), xhl()).unwrap(),
+        }
+        let st = status(&c).unwrap();
+        assert!(st.repair.iter().all(|l| !l.contains("keeps yours")), "{what}: {:?}", st.repair);
+        let put_back = if *what == "missing" {
+            "enstash is put back from dllchain's copy."
+        } else {
+            "enstash is put back from dllchain's copy, as enstash-2.dll."
+        };
+        assert!(st.repair.iter().any(|l| l == put_back), "{what}: {:?}", st.repair);
+        run(&c, plan_repair(&c));
+        clean(&dir);
+        // dllchain's copy runs again, and nothing of someone else's is deleted
+        let names: Vec<String> = chain(&dir).into_iter().map(|e| e.0).collect();
+        assert_eq!(names.len(), 1, "{what}: {names:?}");
+        assert_eq!(read(&dir, &names[0]), Some(enstash()), "{what}");
+        match *what {
+            "missing" => {}
+            "not a dll" => assert_eq!(read(&dir, "enstash.dll"), Some(b"half a download".to_vec())),
+            _ => assert_eq!(read(&dir, "enstash.dll"), Some(xhl())),
+        }
+        assert_eq!(store(&dir, "enstash"), vec![format!("{}.dll", sha256_hex(&enstash()))], "{what}");
+    }
 }
 
 #[test]
