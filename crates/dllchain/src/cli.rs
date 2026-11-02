@@ -2,20 +2,23 @@
 
 mod common;
 
-use chainkit::engine::{Ctx, Plan, plan_install, plan_repair, plan_uninstall, status};
+use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source};
-use common::{GAME, Opts, describe};
+use common::{GAME, Opts, describe, shown};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-dllchain-cli: installs dinput8.dll mods side by side, the way EMF chains them.
+dllchain-cli: installs several dinput8.dll mods side by side, and takes them out again.
 
   dllchain-cli status
   dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
   dllchain-cli uninstall <name> | --all [--yes]
+  dllchain-cli rename <name> <new name> [--yes]   (\"\" gives the mod its own name back)
   dllchain-cli repair [--yes]
+
+  <name> is the mod's file-name word, as `status` shows it (\"enstash\", \"auto-loot-plus\").
 
   --game <folder>        the game folder (default: found through Steam)
   --steam-root <folder>  Steam's folder (default: from the registry)
@@ -28,6 +31,7 @@ enum Cmd {
     Status,
     Install(PathBuf),
     Uninstall(Option<String>),
+    Rename(String, String),
     Repair,
 }
 
@@ -65,6 +69,7 @@ fn parse(args: Vec<String>) -> std::result::Result<Args, String> {
         (Some("install"), 2, false) => Cmd::Install(PathBuf::from(&free[1])),
         (Some("uninstall"), 2, false) => Cmd::Uninstall(Some(free[1].clone())),
         (Some("uninstall"), 1, true) => Cmd::Uninstall(None),
+        (Some("rename"), 3, false) => Cmd::Rename(free[1].clone(), free[2].clone()),
         (None, _, _) => return Err(String::new()),
         _ => return Err(format!("not a command dllchain knows: {}", free.join(" "))),
     };
@@ -78,7 +83,7 @@ enum Outcome {
 
 fn run(a: &Args) -> Result<Outcome> {
     let (ctx, recovered) = a.opts.open()?;
-    println!("{} folder: {}", GAME.name, ctx.dir.display());
+    println!("{} folder: {}", GAME.name, shown(&ctx.dir));
     for n in recovered {
         println!("{n}");
     }
@@ -94,6 +99,7 @@ fn run(a: &Args) -> Result<Outcome> {
             plan_install(&ctx, &src)?
         }
         Cmd::Uninstall(w) => plan_uninstall(&ctx, w.as_deref())?,
+        Cmd::Rename(w, n) => plan_rename(&ctx, w, Some(n))?,
         Cmd::Repair => plan_repair(&ctx)?,
     };
     print!("\n{}", describe(&plan));
@@ -125,7 +131,14 @@ fn print_status(ctx: &Ctx) -> Result<()> {
     }
     for r in &st.rows {
         let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());
-        println!("{}  {}  [{}]  SHA-256 {sha}\n    {}", r.file, r.name, r.role, r.source);
+        let word = r.word.as_deref().map_or(String::new(), |w| format!(" ({w})"));
+        println!("\n{}{word}  {}  [{}]  SHA-256 {sha}", r.name, r.file, r.role);
+        for l in r.details.iter().skip(1) {
+            println!("    {l}");
+        }
+    }
+    if !st.rows.is_empty() {
+        println!();
     }
     for n in &st.notes {
         println!("Note: {n}");

@@ -5,18 +5,19 @@
 
 mod common;
 
-use chainkit::engine::{Ctx, Plan, Row, plan_install, plan_repair, plan_uninstall, status};
+use chainkit::engine::{Ctx, Plan, Row, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source, steam};
-use common::{GAME, Opts, describe};
+use common::{GAME, Opts, describe, shown};
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DeleteObject, GetSysColor, GetSysColorBrush,
-    HDC, HFONT, SetBkColor, SetTextColor, UpdateWindow,
+    COLOR_BTNFACE, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DeleteObject, GetDC, GetSysColor,
+    GetSysColorBrush, GetTextMetricsW, HDC, HFONT, ReleaseDC, SelectObject, SetBkColor, SetTextColor, TEXTMETRICW,
+    UpdateWindow,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -24,16 +25,18 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
-    ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NMHDR, SetWindowTheme,
+    EM_GETLINECOUNT, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT,
+    LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_EDITLABELW, LVM_GETEDITCONTROL,
+    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMTEXTW, LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EDITLABELS,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NMHDR,
+    NMLISTVIEW, NMLVDISPINFOW, SetWindowTheme, ShowScrollBar,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
     SystemParametersInfoForDpi,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::Shell::{
     BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DragAcceptFiles, DragFinish, DragQueryFileW, HDROP,
     SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW,
@@ -49,7 +52,10 @@ const ID_UNINSTALL_ALL: i32 = 106;
 const ID_REPAIR: i32 = 107;
 const ID_OPEN: i32 = 108;
 const ID_LOG: i32 = 109;
+const ID_RENAME: i32 = 110;
 const WM_START: u32 = WM_APP + 1;
+/// A name typed into the list (`wp` 0), or a refused rename (`wp` 1), handled once the list's edit box is gone.
+const WM_RENAME: u32 = WM_APP + 2;
 
 #[derive(Clone, Copy)]
 struct Ctl {
@@ -59,7 +65,7 @@ struct Ctl {
     change: HWND,
     list_label: HWND,
     list: HWND,
-    buttons: [HWND; 5],
+    buttons: [HWND; 6],
     log: HWND,
     font: HFONT,
 }
@@ -69,6 +75,10 @@ struct Data {
     rows: Vec<Row>,
     /// A mod given on the command line, installed once the window is up.
     pending: Option<PathBuf>,
+    /// The messages under the list, shown again when no mod is selected.
+    status_text: String,
+    /// (word, new name) typed into the list.
+    rename: Option<(String, String)>,
 }
 
 thread_local! {
@@ -163,12 +173,13 @@ fn create_controls(main: HWND) {
             main,
             "SysListView32",
             "",
-            WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
             WS_EX_CLIENTEDGE,
             ID_LIST,
         ),
         buttons: [
             button("&Install mod...", ID_INSTALL),
+            button("Re&name", ID_RENAME),
             button("&Uninstall selected", ID_UNINSTALL),
             button("Uninstall &all", ID_UNINSTALL_ALL),
             button("&Repair", ID_REPAIR),
@@ -202,8 +213,8 @@ fn create_controls(main: HWND) {
 }
 
 /// The list's columns, with their width in pixels at 96 DPI (the last one takes the rest).
-const COLUMNS: [(&str, i32); 5] =
-    [("File", 120), ("Mod", 130), ("Role", 150), ("SHA-256", 110), ("Where it came from", 0)];
+const COLUMNS: [(&str, i32); 6] =
+    [("Mod", 130), ("File", 110), ("Role", 190), ("Installed", 80), ("SHA-256", 100), ("Where it came from", 0)];
 
 fn size_columns() {
     let c = ctl();
@@ -251,13 +262,69 @@ fn layout() {
     let list_h = (rest * 45 / 100).max(s(60));
     place(c.list, m, list_top, w - 2 * m, list_h);
     let by = list_top + list_h + s(10);
-    let bw = ((w - 2 * m - 4 * gap) / 5).min(s(150));
+    let n = c.buttons.len() as i32;
+    let bw = ((w - 2 * m - (n - 1) * gap) / n).min(s(150));
     for (i, b) in c.buttons.iter().enumerate() {
         place(*b, m + i as i32 * (bw + gap), by, bw, bh);
     }
     let ly = by + bh + s(10);
     place(c.log, m, ly, w - 2 * m, h - ly - m);
     size_columns();
+    fit_scrollbar();
+}
+
+/// The message pane's scroll bar only when its text does not fit.
+fn fit_scrollbar() {
+    let c = ctl();
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: our edit control and its font, on a DC that is released again.
+    unsafe {
+        ShowScrollBar(c.log, SB_VERT, 0);
+        GetClientRect(c.log, &mut r);
+        let dc = GetDC(c.log);
+        let old = SelectObject(dc, c.font as _);
+        let mut tm: TEXTMETRICW = std::mem::zeroed();
+        GetTextMetricsW(dc, &mut tm);
+        SelectObject(dc, old);
+        ReleaseDC(c.log, dc);
+        let lines = SendMessageW(c.log, EM_GETLINECOUNT, 0, 0) as i32;
+        if lines > (r.bottom - 4) / tm.tmHeight.max(1) {
+            ShowScrollBar(c.log, SB_VERT, 1);
+        }
+    }
+}
+
+/// Shows `text` in the message pane.
+fn show(text: &str) {
+    set_text(ctl().log, text);
+    fit_scrollbar();
+}
+
+fn selected_index() -> isize {
+    // SAFETY: our list view.
+    unsafe { SendMessageW(ctl().list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) }
+}
+
+fn row_at(i: isize) -> Option<Row> {
+    DATA.with(|d| d.borrow().as_ref().and_then(|d| usize::try_from(i).ok().and_then(|i| d.rows.get(i).cloned())))
+}
+
+fn selected() -> Option<Row> {
+    row_at(selected_index())
+}
+
+/// The selected mod's details, or the messages when none is selected.
+fn show_selection() {
+    match selected() {
+        Some(r) => {
+            let mut t = r.details.join("\n");
+            if r.word.is_some() {
+                t.push_str("\n\nTo give it another name, click Rename or press F2.");
+            }
+            show(&t);
+        }
+        None => show(&DATA.with(|d| d.borrow().as_ref().map(|d| d.status_text.clone()).unwrap_or_default())),
+    }
 }
 
 /// The list and the message pane again, with `msg` on top.
@@ -269,6 +336,7 @@ fn refresh(msg: &str) {
         text.push_str(msg.trim_end());
         text.push_str("\n\n");
     }
+    let mut can_repair = false;
     let rows = match o.game_dir().and_then(|d| Ctx::new(&d, GAME)) {
         Err(e) => {
             set_text(c.game, "");
@@ -276,7 +344,7 @@ fn refresh(msg: &str) {
             Vec::new()
         }
         Ok(ctx) => {
-            set_text(c.game, &ctx.dir.display().to_string());
+            set_text(c.game, &shown(&ctx.dir));
             match status(&ctx) {
                 Err(e) => {
                     text.push_str(&e.0);
@@ -294,11 +362,18 @@ fn refresh(msg: &str) {
                     for n in &st.notes {
                         text.push_str(&format!("Note: {n}\n"));
                     }
-                    if st.repair.is_empty() && !st.rows.is_empty() {
-                        text.push_str(
-                            "Everything is in place: nothing to repair. Select a mod to uninstall it.
-",
-                        );
+                    let listed = st.rows.iter().any(|r| r.word.is_some());
+                    let by_hand = st.rows.iter().find(|r| r.word.is_none() && r.file.as_str() == GAME.host_dll);
+                    if let Some(r) = by_hand.filter(|_| !listed) {
+                        text.push_str(&format!(
+                            "{} is {}, put there by hand or by another tool. dllchain leaves it as it is; when you install another mod, it joins the chain.\n",
+                            GAME.host_dll, r.name
+                        ));
+                    } else if st.repair.is_empty() && !st.rows.is_empty() {
+                        text.push_str("Everything is in place: nothing to repair.\n");
+                    }
+                    if !st.rows.is_empty() {
+                        text.push_str("Select a mod to see everything dllchain knows about it.\n");
                     }
                     if !st.repair.is_empty() {
                         text.push_str("\nSomething changed the chain since dllchain last ran. Repair would:\n");
@@ -306,6 +381,7 @@ fn refresh(msg: &str) {
                             text.push_str(&format!("  - {l}\n"));
                         }
                     }
+                    can_repair = !st.repair.is_empty();
                     st.rows
                 }
             }
@@ -316,7 +392,8 @@ fn refresh(msg: &str) {
         SendMessageW(c.list, LVM_DELETEALLITEMS, 0, 0);
         for (i, r) in rows.iter().enumerate() {
             let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());
-            let cells = [r.file.to_string(), r.name.clone(), r.role.clone(), sha, r.source.clone()];
+            let at = r.at.split(' ').next().unwrap_or_default().to_string();
+            let cells = [r.name.clone(), r.file.to_string(), r.role.clone(), at, sha, r.source.clone()];
             for (k, cell) in cells.iter().enumerate() {
                 let mut text = wide(cell);
                 let item = LVITEMW {
@@ -333,26 +410,27 @@ fn refresh(msg: &str) {
     }
     size_columns();
     let has_installed = rows.iter().any(|r| r.installed);
+    let has_listed = rows.iter().any(|r| r.word.is_some());
     let has_game = o.game_dir().is_ok();
-    // SAFETY: our buttons.
-    unsafe {
-        EnableWindow(c.buttons[0], has_game as i32);
-        EnableWindow(c.buttons[1], has_installed as i32);
-        EnableWindow(c.buttons[2], has_installed as i32);
-        EnableWindow(c.buttons[3], has_game as i32);
-        EnableWindow(c.buttons[4], has_game as i32);
+    let on = [has_game, has_listed, has_installed, has_installed, can_repair, has_game];
+    for (b, on) in c.buttons.iter().zip(on) {
+        // SAFETY: our button.
+        unsafe { EnableWindow(*b, on as i32) };
     }
+    let text = text.trim_end().to_string();
     DATA.with(|d| {
         if let Some(d) = d.borrow_mut().as_mut() {
             d.rows = rows;
+            d.status_text = text.clone();
         }
     });
-    set_text(c.log, text.trim_end());
+    show(&text);
 }
 
 enum Action {
     Install(PathBuf),
     Uninstall(Option<String>),
+    Rename(String, String),
     Repair,
 }
 
@@ -376,10 +454,16 @@ fn act(a: Action) {
             }
             Action::Uninstall(w) => (plan_uninstall(&ctx, w.as_deref())?, "Uninstall".into(), String::new()),
             Action::Repair => (plan_repair(&ctx)?, "Repair".into(), String::new()),
+            Action::Rename(w, n) => (plan_rename(&ctx, w, Some(n))?, "Rename".into(), String::new()),
         };
         let words = describe(&plan);
         if plan.is_empty() {
             return Ok(format!("{head}{intro}{words}"));
+        }
+        if let Action::Rename(..) = a {
+            // only dllchain's list changes, so there is nothing to confirm
+            o.apply(&ctx, &plan)?;
+            return Ok(format!("{head}Done: {}", plan.summary.join("\n")));
         }
         let icon = if plan.replaces.is_empty() { MB_ICONQUESTION } else { MB_ICONWARNING };
         if message(&format!("dllchain - {title}"), &format!("{intro}{words}\nGo ahead?"), MB_OKCANCEL | icon) != IDOK {
@@ -470,6 +554,7 @@ fn on_command(id: i32, code: u32) {
                 act(Action::Install(p));
             }
         }
+        (ID_RENAME, BN_CLICKED) => rename_selected(),
         (ID_UNINSTALL, BN_CLICKED) => uninstall_selected(),
         (ID_UNINSTALL_ALL, BN_CLICKED) => act(Action::Uninstall(None)),
         (ID_REPAIR, BN_CLICKED) => act(Action::Repair),
@@ -484,13 +569,87 @@ fn on_command(id: i32, code: u32) {
     }
 }
 
+/// Opens the selected mod's name for typing; the list reports the new name when Enter is pressed.
+fn rename_selected() {
+    let i = selected_index();
+    match row_at(i) {
+        None => {
+            message("dllchain", "Pick a mod in the list first.", MB_OK | MB_ICONINFORMATION);
+        }
+        Some(r) if r.word.is_none() => not_listed(&r),
+        Some(_) => {
+            let list = ctl().list;
+            // SAFETY: our list view and a row in it.
+            unsafe {
+                SetFocus(list);
+                SendMessageW(list, LVM_EDITLABELW, i as usize, 0);
+            }
+        }
+    }
+}
+
+fn not_listed(r: &Row) {
+    message(
+        "dllchain",
+        &format!(
+            "{} ({}) is not on dllchain's list, so dllchain does not name it. It joins the list when you install another mod.",
+            r.file, r.name
+        ),
+        MB_OK | MB_ICONINFORMATION,
+    );
+}
+
+/// The list's notifications; the result goes back to the list.
+fn on_list_notify(hwnd: HWND, code: u32, lp: LPARAM) -> LRESULT {
+    match code {
+        NM_DBLCLK => uninstall_selected(),
+        LVN_ITEMCHANGED => {
+            // SAFETY: this notification comes with an NMLISTVIEW.
+            let n = unsafe { &*(lp as *const NMLISTVIEW) };
+            if (n.uOldState ^ n.uNewState) & LVIS_SELECTED != 0 {
+                show_selection();
+            }
+        }
+        LVN_BEGINLABELEDITW => {
+            // SAFETY: this notification comes with an NMLVDISPINFOW.
+            let n = unsafe { &*(lp as *const NMLVDISPINFOW) };
+            // only mods on dllchain's list can be named; for anything else typing never starts
+            if row_at(n.item.iItem as isize).is_none_or(|r| r.word.is_none()) {
+                // SAFETY: explained once the list has refused the edit.
+                unsafe { PostMessageW(hwnd, WM_RENAME, 1, 0) };
+                return 1;
+            }
+        }
+        LVN_ENDLABELEDITW => {
+            // SAFETY: this notification comes with an NMLVDISPINFOW; pszText is null when the edit was cancelled.
+            let n = unsafe { &*(lp as *const NMLVDISPINFOW) };
+            let word = row_at(n.item.iItem as isize).and_then(|r| r.word);
+            if let (false, Some(w)) = (n.item.pszText.is_null(), word) {
+                // SAFETY: a NUL-terminated string from the list view.
+                let text = unsafe {
+                    let mut len = 0;
+                    while *n.item.pszText.add(len) != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16_lossy(std::slice::from_raw_parts(n.item.pszText, len))
+                };
+                DATA.with(|d| {
+                    if let Some(d) = d.borrow_mut().as_mut() {
+                        d.rename = Some((w, text));
+                    }
+                });
+                // SAFETY: renamed once the list's edit box is gone.
+                unsafe { PostMessageW(hwnd, WM_RENAME, 0, 0) };
+            }
+            // the list shows the new name once dllchain's list has it
+        }
+        _ => {}
+    }
+    0
+}
+
 fn uninstall_selected() {
-    let c = ctl();
-    // SAFETY: our list view.
-    let i = unsafe { SendMessageW(c.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) };
-    let row =
-        DATA.with(|d| d.borrow().as_ref().and_then(|d| usize::try_from(i).ok().and_then(|i| d.rows.get(i).cloned())));
-    match row {
+    match selected() {
         None => {
             message("dllchain", "Pick a mod in the list first.", MB_OK | MB_ICONINFORMATION);
         }
@@ -534,7 +693,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe {
                 let d = GetDpiForWindow(hwnd).max(96) as i32;
                 let mmi = lp as *mut MINMAXINFO;
-                (*mmi).ptMinTrackSize.x = 660 * d / 96;
+                (*mmi).ptMinTrackSize.x = 760 * d / 96;
                 (*mmi).ptMinTrackSize.y = 440 * d / 96;
             }
             0
@@ -578,8 +737,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NOTIFY => {
             // SAFETY: WM_NOTIFY comes with an NMHDR.
             let h = unsafe { &*(lp as *const NMHDR) };
-            if h.hwndFrom == ctl().list && h.code == NM_DBLCLK {
-                uninstall_selected();
+            if h.hwndFrom == ctl().list { on_list_notify(hwnd, h.code, lp) } else { 0 }
+        }
+        WM_RENAME => {
+            if wp == 1 {
+                if let Some(r) = selected() {
+                    not_listed(&r);
+                }
+            } else if let Some((w, n)) = DATA.with(|d| d.borrow_mut().as_mut().and_then(|d| d.rename.take())) {
+                act(Action::Rename(w, n));
             }
             0
         }
@@ -628,7 +794,9 @@ fn parse_args() -> (Opts, Option<PathBuf>) {
 
 fn main() {
     let (opts, pending) = parse_args();
-    DATA.with(|d| *d.borrow_mut() = Some(Data { opts, rows: Vec::new(), pending }));
+    DATA.with(|d| {
+        *d.borrow_mut() = Some(Data { opts, rows: Vec::new(), pending, status_text: String::new(), rename: None })
+    });
     // SAFETY: plain Win32 start-up on this thread; every pointer passed outlives its call.
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -681,7 +849,9 @@ fn main() {
         PostMessageW(hwnd, WM_START, 0, 0);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if IsDialogMessageW(hwnd, &msg) == 0 {
+            // while a name is typed into the list, Enter and Esc belong to its edit box, not to the dialog keys
+            let editing = SendMessageW(ctl().list, LVM_GETEDITCONTROL, 0, 0) != 0;
+            if editing || IsDialogMessageW(hwnd, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

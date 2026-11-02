@@ -26,10 +26,13 @@ pub struct ModSource {
     pub files: Vec<(RelPath, Vec<u8>)>,
     /// Zip entries outside the folder that holds the DLL, which are not installed.
     pub ignored: Vec<String>,
+    /// Where the file was downloaded from, from the note Windows keeps with a download (`Zone.Identifier`).
+    pub from_url: Option<String>,
 }
 
 pub fn read(path: &Path, game: &Game) -> Result<ModSource> {
     let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let from_url = downloaded_from(path);
     let meta = std::fs::metadata(path).map_err(|e| crate::Error(format!("could not open {}: {e}", path.display())))?;
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     match ext.as_str() {
@@ -55,9 +58,10 @@ pub fn read(path: &Path, game: &Game) -> Result<ModSource> {
                 dll,
                 files: Vec::new(),
                 ignored: Vec::new(),
+                from_url,
             })
         }
-        "zip" => read_zip(path, &label, game),
+        "zip" => Ok(ModSource { from_url, ..read_zip(path, &label, game)? }),
         _ => fail!("{label}: pick a mod's .zip or its .dll"),
     }
 }
@@ -138,7 +142,30 @@ fn read_zip(path: &Path, label: &str, game: &Game) -> Result<ModSource> {
         }
     }
     let stem = Path::new(label).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    Ok(ModSource { label: label.to_string(), sha256, word_hint: word_hint(&stem), dll, files, ignored })
+    Ok(ModSource { label: label.to_string(), sha256, word_hint: word_hint(&stem), dll, files, ignored, from_url: None })
+}
+
+/// The web page or address a downloaded file came from. Browsers save it next to the file, in the
+/// `Zone.Identifier` stream Windows uses for its "downloaded from the internet" warning; the page it was linked from
+/// (`ReferrerUrl`) is preferred over the download link (`HostUrl`). Only the site and path are kept.
+pub fn downloaded_from(path: &Path) -> Option<String> {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    let bytes = std::fs::read(&stream).ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    zone_url(&String::from_utf8_lossy(&bytes))
+}
+
+fn zone_url(text: &str) -> Option<String> {
+    let value = |key: &str| {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            k.trim().eq_ignore_ascii_case(key).then(|| v.trim().to_string())
+        })
+    };
+    ["ReferrerUrl", "HostUrl"].into_iter().find_map(|k| value(k).and_then(|v| crate::record::clean_url(&v)))
 }
 
 /// A file a zip may not put into the game folder.
@@ -265,6 +292,30 @@ mod tests {
         let s = read(&p, &ENSHROUDED).unwrap();
         assert_eq!(s.word_hint, "some-mod");
         assert!(s.files.is_empty());
+    }
+
+    #[test]
+    fn where_a_download_came_from() {
+        let dir = tmp("downloads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("Mod-1-0.zip");
+        make_zip(&p, &[("dinput8.dll", &fake_dll(&[], None))]);
+        assert_eq!(read(&p, &ENSHROUDED).unwrap().from_url, None);
+        let mut stream = p.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        std::fs::write(
+            &stream,
+            "[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://www.nexusmods.com/enshrouded/mods/170?tab=files\r\n\
+             HostUrl=https://cf-files.nexusmods.com/x/Mod.zip?user_id=123&key=abc\r\n",
+        )
+        .unwrap();
+        let from = read(&p, &ENSHROUDED).unwrap().from_url;
+        assert_eq!(from.as_deref(), Some("https://www.nexusmods.com/enshrouded/mods/170"));
+        assert_eq!(
+            zone_url("[ZoneTransfer]\nZoneId=3\nReferrerUrl=about:blank\nHostUrl=https://example.com/a.zip?t=1"),
+            Some("https://example.com/a.zip".into())
+        );
+        assert_eq!(zone_url("[ZoneTransfer]\nZoneId=3\n"), None);
     }
 
     #[test]

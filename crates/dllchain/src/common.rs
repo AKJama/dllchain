@@ -114,3 +114,34 @@ pub fn describe(plan: &Plan) -> String {
     }
     s
 }
+
+/// A folder as Explorer shows it: with its real capitals (Steam keeps its path in lower case), without the `\\?\`
+/// prefix. The path as given when it cannot be read.
+pub fn shown(p: &std::path::Path) -> String {
+    let real = std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.display().to_string());
+    without_verbatim(&real)
+}
+
+fn without_verbatim(p: &str) -> String {
+    match p.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => p.strip_prefix(r"\\?\").unwrap_or(p).to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_are_shown_as_explorer_shows_them() {
+        assert_eq!(without_verbatim(r"\\?\C:\Program Files (x86)\Steam"), r"C:\Program Files (x86)\Steam");
+        assert_eq!(without_verbatim(r"\\?\UNC\server\share\Games"), r"\\server\share\Games");
+        assert_eq!(without_verbatim(r"D:\Games"), r"D:\Games");
+        let dir = std::env::temp_dir().join("dllchain-Shown-Case");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lower = std::path::PathBuf::from(dir.display().to_string().to_lowercase());
+        let s = shown(&lower);
+        assert!(s.ends_with("dllchain-Shown-Case") && !s.starts_with(r"\\?\"), "{s}");
+    }
+}

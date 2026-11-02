@@ -11,7 +11,7 @@ use crate::dllinfo::{DllInfo, WordFrom, inspect};
 use crate::game::Game;
 use crate::hash::{sha256_hex, short};
 use crate::paths::{RelPath, is_word, resolve};
-use crate::record::{FileRec, Kind, ModRec, RECORD, Record, store_rel};
+use crate::record::{FileRec, Kind, ModRec, RECORD, Record, clean_name, store_rel};
 use crate::source::{ModSource, check_target};
 use crate::steam::is_game_folder;
 use crate::txn::{Txn, recover};
@@ -277,7 +277,10 @@ impl<'a> Work<'a> {
     }
 
     fn display(&self, word: &str) -> String {
-        self.ctx.game.display(word)
+        match self.mods.iter().find(|m| m.word == word) {
+            Some(m) => name_of(self.ctx.game, m),
+            None => self.ctx.game.display(word),
+        }
     }
 
     fn unique_word(&self, word: &str) -> String {
@@ -341,6 +344,8 @@ impl<'a> Work<'a> {
             at: clock::now_text(),
             source_sha: "-".into(),
             label: format!("found as {}", self.ctx.game.host_dll),
+            name: default_name(info),
+            from_url: None,
             dll_sha: info.sha256.clone(),
             dll_at: host,
             replaced_dll: None,
@@ -667,7 +672,7 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     let mut w = Work::new(ctx, &scan, format!("install {} (SHA-256 {})", src.label, src.sha256))?;
     let replaced_now = w.adopt_host(Some(&word));
     w.switch_on = Some(word.clone());
-    let display = ctx.game.display(&word);
+    let display = w.display(&word);
 
     let prev = w.mods.iter().position(|m| m.word == word);
     let mut rec = match prev {
@@ -700,6 +705,8 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
             at: String::new(),
             source_sha: String::new(),
             label: String::new(),
+            name: None,
+            from_url: None,
             dll_sha: String::new(),
             dll_at: ctx.host(),
             replaced_dll: None,
@@ -713,6 +720,10 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     rec.at = clock::now_text();
     rec.source_sha = src.sha256.clone();
     rec.label = src.label.clone();
+    rec.from_url = src.from_url.clone();
+    if rec.name.is_none() {
+        rec.name = default_name(&info);
+    }
     rec.dll_sha = info.sha256.clone();
 
     plan_files(&mut w, &mut rec, src)?;
@@ -855,6 +866,11 @@ pub fn plan_repair(ctx: &Ctx) -> Result<Plan> {
     let scan = scan(ctx)?;
     let mut w = Work::new(ctx, &scan, "repair".into())?;
     w.plan.first_install = false;
+    if scan.record.is_empty() {
+        // dllchain has installed nothing here, so there is nothing of its own to put right; a mod already there
+        // joins the chain when the first mod is installed
+        return Ok(w.plan);
+    }
     w.adopt_host(None);
     w.layout()?;
     for m in &w.mods {
@@ -869,6 +885,53 @@ pub fn plan_repair(ctx: &Ctx) -> Result<Plan> {
         }
     }
     Ok(w.finish())
+}
+
+/// Gives a mod on dllchain's list the name players see (`None` or an empty name: back to its own name). Only the
+/// record changes; files keep their names.
+pub fn plan_rename(ctx: &Ctx, word: &str, name: Option<&str>) -> Result<Plan> {
+    let scan = scan(ctx)?;
+    let mut record = scan.record.clone();
+    let Some(m) = record.mods.iter_mut().find(|m| m.word == word) else {
+        fail!("{word} is not on dllchain's list; dllchain names only the mods it installed or chained");
+    };
+    let old = name_of(ctx.game, m);
+    let new = name.and_then(clean_name);
+    m.name = match new {
+        Some(n) => Some(n),
+        None => {
+            let dll = load_dll(ctx, &scan, m).and_then(|b| inspect(&b, ctx.game).ok());
+            dll.as_ref().and_then(default_name)
+        }
+    };
+    let now = name_of(ctx.game, m);
+    let mut plan = Plan { action: format!("rename {word}"), notes: scan.notes.clone(), ..Plan::default() };
+    if now == old {
+        plan.notes.push(format!("{old} already has that name"));
+        return Ok(plan);
+    }
+    plan.summary.push(format!("show {old} as {now} (only dllchain's list changes; no file is renamed)"));
+    let rel = RelPath::of(RECORD);
+    let text = record.to_text().into_bytes();
+    plan.expect_files.push((rel.clone(), Some(sha256_hex(&text))));
+    plan.steps.push(Step::Write(rel, text));
+    plan.record = record;
+    Ok(plan)
+}
+
+/// The name players see: the one the player gave, else the DLL's product name, else the known tool's name or the
+/// file-name word.
+pub fn name_of(game: &Game, m: &ModRec) -> String {
+    m.name.clone().unwrap_or_else(|| game.display(&m.word))
+}
+
+/// A DLL's own name, for one that is not a known tool: its product name.
+fn default_name(info: &DllInfo) -> Option<String> {
+    match &info.word {
+        Some((_, WordFrom::Known)) => None,
+        // a DLL built from a template can keep Windows' own product name, which says nothing
+        _ => info.product_name.as_deref().filter(|p| !p.contains("Microsoft")).and_then(clean_name),
+    }
 }
 
 /// Uninstall one mod (by its word) or, with `None`, everything dllchain installed.
@@ -929,6 +992,8 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
                         at: m.at.clone(),
                         source_sha: "-".into(),
                         label: format!("found as {}", ctx.game.host_dll),
+                        name: m.name.clone(),
+                        from_url: None,
                         dll_sha: r.clone(),
                         dll_at: ctx.host(),
                         replaced_dll: None,
@@ -1102,13 +1167,17 @@ fn append_log(ctx: &Ctx, action: &str, lines: &[String]) {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub file: RelPath,
-    /// `None` for a DLL dllchain does not know.
+    /// `None` for a DLL that is not on dllchain's list.
     pub word: Option<String>,
     pub name: String,
     pub role: String,
+    /// When dllchain installed or chained it (local time), empty when it is not on dllchain's list.
+    pub at: String,
     pub source: String,
     pub sha: Option<String>,
     pub installed: bool,
+    /// Everything dllchain knows about it, one line each, for the details pane.
+    pub details: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1132,58 +1201,111 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                 .collect()
         })
         .unwrap_or_default();
-    let describe = |rel: &RelPath| -> (Option<String>, String, String, Option<String>, bool) {
+    let host = ctx.host();
+    let row = |rel: &RelPath, role: String| -> Row {
         let sha = ctx.sha(rel);
+        let mut details = vec![format!("{rel}: {role}")];
         if let Some(m) = scan.record.mods.iter().find(|m| Some(&m.dll_sha) == sha.as_ref()) {
-            let src = match m.kind {
-                Kind::Installed => format!("installed by dllchain from {} on {}", m.label, m.at),
-                Kind::Adopted => format!("not installed by dllchain ({}); dllchain keeps it in the chain", m.label),
+            let name = name_of(ctx.game, m);
+            let source = match m.kind {
+                Kind::Installed => format!("installed by dllchain from {}", m.label),
+                Kind::Adopted => "there before dllchain, or copied in by hand; dllchain keeps it in the chain".into(),
             };
-            return (Some(m.word.clone()), ctx.game.display(&m.word), src, sha, m.kind == Kind::Installed);
+            details[0] = format!("{name}: {rel}, {role}");
+            match m.kind {
+                Kind::Installed => {
+                    details.push(format!("Installed {} from {}", m.at, m.label));
+                    if m.source_sha != "-" {
+                        details.push(format!("SHA-256 of {}: {}", m.label, m.source_sha));
+                    }
+                }
+                Kind::Adopted => details.push(format!(
+                    "Found {} and added to dllchain's list; dllchain did not install it and never deletes it",
+                    m.at
+                )),
+            }
+            details.push(match &m.from_url {
+                Some(u) => format!("Downloaded from {u}"),
+                None => "Download site: not known (Windows kept no note of one)".into(),
+            });
+            details.push(format!("SHA-256 of the DLL: {}", m.dll_sha));
+            if let Some(r) = &m.replaced_dll {
+                details.push(format!("Replaced an earlier copy (SHA-256 {}), which comes back on uninstall", short(r)));
+            }
+            for f in &m.files {
+                let state = match ctx.sha(&f.rel) {
+                    None => " (missing)",
+                    Some(s) if s != f.sha => " (changed since)",
+                    _ => "",
+                };
+                let backup = if f.backup.is_some() { ", original kept" } else { "" };
+                details.push(format!("  file {}{state}{backup}", f.rel));
+            }
+            if m.word != name {
+                details.push(format!("dllchain's name for it: {}", m.word));
+            }
+            return Row {
+                file: rel.clone(),
+                word: Some(m.word.clone()),
+                name,
+                role,
+                at: m.at.clone(),
+                source,
+                sha,
+                installed: m.kind == Kind::Installed,
+                details,
+            };
         }
         let info = ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok());
         let name = info
             .as_ref()
-            .and_then(|i| i.word.as_ref().map(|w| ctx.game.display(&w.0)))
+            .and_then(|i| default_name(i).or_else(|| i.word.as_ref().map(|w| ctx.game.display(&w.0))))
             .unwrap_or_else(|| "unknown".into());
-        let src = if emf_moved.contains(&rel.key()) {
+        let source = if emf_moved.contains(&rel.key()) {
             "moved by EMF (emf\\moved.txt)".to_string()
+        } else if rel.same(&host) {
+            "put there by hand or by another tool".to_string()
         } else {
             "not installed by dllchain".to_string()
         };
-        (None, name, src, sha, false)
+        details[0] = format!("{name}: {rel}, {role}");
+        details.push(format!("Not on dllchain's list: {source}."));
+        if rel.same(&host) && scan.record.is_empty() {
+            details.push(
+                "dllchain leaves it as it is. When you install another mod, it joins the chain and dllchain keeps a copy of it."
+                    .into(),
+            );
+        }
+        if let Some(p) = info.as_ref().and_then(|i| i.product_name.clone()) {
+            details.push(format!("Product name in the DLL: {p}"));
+        }
+        match &sha {
+            Some(s) => details.push(format!("SHA-256: {s}")),
+            None => details.push("The file is missing.".into()),
+        }
+        Row { file: rel.clone(), word: None, name, role, at: String::new(), source, sha, installed: false, details }
     };
-    let host = ctx.host();
     if ctx.exists(&host) {
-        let (word, name, source, sha, installed) = describe(&host);
         let can = scan.host.as_ref().map(|(_, i)| i.can_host).unwrap_or(false);
-        let role = if can { "host, starts the chain".into() } else { "host, cannot start others".into() };
-        st.rows.push(Row { file: host.clone(), word, name, role, source, sha, installed });
+        let role = if can { "game loads it; starts others" } else { "game loads it; starts no others" };
+        st.rows.push(row(&host, role.into()));
     }
     for e in &scan.parsed.entries {
-        let (word, name, source, sha, installed) = describe(&e.name);
-        let role = match (e.on, sha.is_some()) {
-            (true, true) => "chained".to_string(),
-            (false, _) => "chained, switched off".to_string(),
-            (true, false) => "chained, file missing".to_string(),
+        let role = match (e.on, ctx.exists(&e.name)) {
+            (true, true) => format!("started by {}", ctx.game.host_dll),
+            (false, _) => "switched off".to_string(),
+            (true, false) => "listed, but missing".to_string(),
         };
-        st.rows.push(Row { file: e.name.clone(), word, name, role, source, sha, installed });
+        st.rows.push(row(&e.name, role));
     }
     for p in ctx.game.proxy_names {
         let rel = RelPath::of(&format!("{p}.dll"));
         if rel.same(&host) || !ctx.exists(&rel) {
             continue;
         }
-        let (word, name, _, sha, _) = describe(&rel);
-        st.rows.push(Row {
-            file: rel,
-            word,
-            name,
-            role: "other proxy DLL, left alone".into(),
-            source: "not installed by dllchain".into(),
-            sha,
-            installed: false,
-        });
+        let mut r = row(&rel, "another loader's DLL, left alone".into());
+        r.source = "not installed by dllchain".into();
+        st.rows.push(r);
     }
     match plan_repair(ctx) {
         Ok(p) if !p.is_empty() => st.repair = p.summary,
@@ -1201,6 +1323,6 @@ pub fn installed(ctx: &Ctx) -> Result<Vec<(String, String, RelPath)>> {
         .mods
         .iter()
         .filter(|m| m.kind == Kind::Installed)
-        .map(|m| (m.word.clone(), ctx.game.display(&m.word), m.dll_at.clone()))
+        .map(|m| (m.word.clone(), name_of(ctx.game, m), m.dll_at.clone()))
         .collect())
 }

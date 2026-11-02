@@ -39,6 +39,10 @@ pub struct ModRec {
     pub source_sha: String,
     /// The zip's or DLL's file name, or how it was found.
     pub label: String,
+    /// The name the player gave it, or the DLL's own product name; `None`: the known tool's name or its word.
+    pub name: Option<String>,
+    /// Where the zip or DLL was downloaded from, as Windows noted it (without the query part, which can hold ids).
+    pub from_url: Option<String>,
     pub dll_sha: String,
     /// Where dllchain last saw or put its DLL.
     pub dll_at: RelPath,
@@ -67,6 +71,34 @@ fn clean(s: &str) -> String {
     s.chars().map(|c| if c == '\t' || c == '\r' || c == '\n' { ' ' } else { c }).collect()
 }
 
+/// A mod name as players see it: trimmed, at most 60 characters, no control characters. `None` when nothing is left.
+pub fn clean_name(s: &str) -> Option<String> {
+    let s: String = s.chars().filter(|c| !c.is_control()).collect();
+    let s: String = s.trim().chars().take(60).collect();
+    let s = s.trim_end().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// A web address worth keeping: http or https, without the user part, the query and the fragment (download links
+/// carry ids and keys there). `None` for anything else.
+pub fn clean_url(s: &str) -> Option<String> {
+    let s = s.trim();
+    let lower = s.to_ascii_lowercase();
+    let scheme = ["https://", "http://"].into_iter().find(|p| lower.starts_with(p))?;
+    let rest = &s[scheme.len()..];
+    let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = host.rsplit('@').next().unwrap_or_default();
+    if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)) {
+        return None;
+    }
+    if path.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let url = format!("{scheme}{}{path}", host.to_ascii_lowercase());
+    (url.len() <= 400).then_some(url)
+}
+
 impl Record {
     pub fn next_order(&self) -> u32 {
         self.mods.iter().map(|m| m.order).max().map_or(1, |o| o + 1)
@@ -93,6 +125,12 @@ impl Record {
                 clean(&m.label)
             ));
             out.push(format!("dll\t{}\t{}\t{}", m.word, m.dll_at, m.dll_sha));
+            if let Some(n) = &m.name {
+                out.push(format!("name\t{}\t{}", m.word, clean(n)));
+            }
+            if let Some(u) = &m.from_url {
+                out.push(format!("from\t{}\t{}", m.word, clean(u)));
+            }
             if let Some(r) = &m.replaced_dll {
                 out.push(format!("replaced-dll\t{}\t{r}", m.word));
             }
@@ -165,6 +203,8 @@ impl Record {
                     at: at.to_string(),
                     source_sha: source,
                     label: label.to_string(),
+                    name: None,
+                    from_url: None,
                     dll_sha: String::new(),
                     dll_at: RelPath::of("dinput8.dll"),
                     replaced_dll: None,
@@ -177,6 +217,14 @@ impl Record {
                 let m = self.mod_mut(w)?;
                 m.dll_at = at;
                 m.dll_sha = s;
+            }
+            ["name", w, n] => {
+                let n = clean_name(n).ok_or("not a name")?;
+                self.mod_mut(w)?.name = Some(n);
+            }
+            ["from", w, u] => {
+                let u = clean_url(u).ok_or("not a web address")?;
+                self.mod_mut(w)?.from_url = Some(u);
             }
             ["replaced-dll", w, s] => {
                 let s = sha(s)?;
@@ -236,6 +284,8 @@ mod tests {
                 at: "2026-11-03 10:00:00".into(),
                 source_sha: s.clone(),
                 label: "Auto\tLoot.zip".into(),
+                name: Some("My loot mod".into()),
+                from_url: Some("https://www.nexusmods.com/enshrouded/mods/170".into()),
                 dll_sha: "b".repeat(64),
                 dll_at: RelPath::of("dinput8.dll"),
                 replaced_dll: Some("c".repeat(64)),
@@ -259,6 +309,24 @@ mod tests {
         let mut want = r.clone();
         want.mods[0].label = "Auto Loot.zip".into();
         assert_eq!(back, want);
+    }
+
+    #[test]
+    fn names_and_web_addresses_are_cleaned() {
+        assert_eq!(clean_name("  Loot\u{7}  "), Some("Loot".into()));
+        assert_eq!(clean_name(" \t "), None);
+        assert_eq!(clean_name(&"x".repeat(80)).map(|s| s.len()), Some(60));
+        assert_eq!(
+            clean_url("https://user:pw@Files.Nexus-CDN.com/3160/170/ALP.zip?md5=1&expires=2&user_id=123#x"),
+            Some("https://files.nexus-cdn.com/3160/170/ALP.zip".into())
+        );
+        assert_eq!(
+            clean_url("https://www.nexusmods.com/enshrouded/mods/170?tab=files"),
+            Some("https://www.nexusmods.com/enshrouded/mods/170".into())
+        );
+        for bad in ["about:internet", "file:///C:/x.zip", "javascript:alert(1)", "https://", "https://a b/c"] {
+            assert_eq!(clean_url(bad), None, "{bad}");
+        }
     }
 
     #[test]

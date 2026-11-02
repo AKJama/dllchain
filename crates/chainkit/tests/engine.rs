@@ -3,7 +3,7 @@
 
 use chainkit::chainini::ChainFile;
 use chainkit::dllinfo::fake_dll;
-use chainkit::engine::{Ctx, Plan, apply, plan_install, plan_repair, plan_uninstall, status};
+use chainkit::engine::{Ctx, Plan, apply, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::game::ENSHROUDED;
 use chainkit::hash::sha256_hex;
 use chainkit::paths::RelPath;
@@ -88,6 +88,7 @@ fn src(label: &str, dll: Vec<u8>, files: &[(&str, &[u8])]) -> ModSource {
         dll,
         files: files.iter().map(|(n, b)| (RelPath::parse(n).unwrap(), b.to_vec())).collect(),
         ignored: Vec::new(),
+        from_url: None,
     }
 }
 
@@ -438,4 +439,57 @@ fn an_unfinished_run_blocks_until_it_is_undone() {
     assert!(plan_install(&c, &src("xhl.zip", xhl(), &[])).is_err());
     assert!(c.recover().unwrap().is_some());
     install(&c, &src("xhl.zip", xhl(), &[]));
+}
+
+#[test]
+fn a_mod_put_there_by_hand_needs_no_repair() {
+    let dir = game("byhand");
+    std::fs::write(dir.join("dinput8.dll"), xhl()).unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    assert!(plan_repair(&c).unwrap().is_empty());
+    let st = status(&c).unwrap();
+    assert!(st.repair.is_empty(), "{:?}", st.repair);
+    assert_eq!(st.rows.len(), 1);
+    let r = &st.rows[0];
+    assert_eq!(r.name, "XHL Core");
+    assert_eq!(r.role, "game loads it; starts no others");
+    assert_eq!(r.source, "put there by hand or by another tool");
+    assert!(r.details.iter().any(|l| l.contains("joins the chain")), "{:?}", r.details);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn rename_changes_only_the_name() {
+    let dir = game("rename");
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    let mut s = src("xhl.zip", xhl(), &[]);
+    s.from_url = Some("https://www.nexusmods.com/enshrouded/mods/1".into());
+    install(&c, &s);
+    let files = without_own(&snapshot(&dir));
+    let name = |c: &Ctx, file: &str| status(c).unwrap().rows.into_iter().find(|r| r.file.as_str() == file).unwrap();
+    // a DLL dllchain does not know shows its own product name
+    assert_eq!(name(&c, "xhl-core.dll").name, "XHL Core");
+    run(&c, plan_rename(&c, "xhl-core", Some("  Extra HUD Lines ")));
+    let r = name(&c, "xhl-core.dll");
+    assert_eq!(r.name, "Extra HUD Lines");
+    assert!(!r.at.is_empty());
+    assert!(
+        r.details.iter().any(|l| l == "Downloaded from https://www.nexusmods.com/enshrouded/mods/1"),
+        "{:?}",
+        r.details
+    );
+    assert!(r.details.iter().any(|l| l == "dllchain's name for it: xhl-core"), "{:?}", r.details);
+    assert_eq!(without_own(&snapshot(&dir)), files);
+    // the same name again changes nothing; an empty one gives the DLL's own name back
+    assert!(plan_rename(&c, "xhl-core", Some("Extra HUD Lines")).unwrap().is_empty());
+    run(&c, plan_rename(&c, "xhl-core", Some("   ")));
+    assert_eq!(name(&c, "xhl-core.dll").name, "XHL Core");
+    // a known tool keeps its known name until renamed, and an update keeps the player's name
+    run(&c, plan_rename(&c, "auto-loot-plus", Some("ALP")));
+    install(&c, &src("alp.zip", alp2(), &[]));
+    assert_eq!(name(&c, "dinput8.dll").name, "ALP");
+    assert!(plan_rename(&c, "nobody", Some("x")).is_err());
+    clean(&dir);
 }
