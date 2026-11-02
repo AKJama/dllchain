@@ -454,8 +454,8 @@ fn a_mod_put_there_by_hand_needs_no_repair() {
     let r = &st.rows[0];
     assert_eq!(r.name, "XHL Core");
     assert_eq!(r.role, "game loads it; starts no others");
-    assert_eq!(r.source, "put there by hand or by another tool");
-    assert!(r.details.iter().any(|l| l.contains("joins the chain")), "{:?}", r.details);
+    assert_eq!(r.source, "put there by hand");
+    assert!(r.details.iter().any(|(_, v)| v.contains("joins the chain")), "{:?}", r.details);
     assert_eq!(snapshot(&dir), before);
 }
 
@@ -477,11 +477,11 @@ fn rename_changes_only_the_name() {
     assert!(!r.at.is_empty());
     assert_eq!(r.page.as_deref(), Some("https://www.nexusmods.com/enshrouded/mods/1"));
     assert!(
-        r.details.iter().any(|l| l == "Downloaded from https://www.nexusmods.com/enshrouded/mods/1"),
+        r.details.iter().any(|(k, v)| k == "Web page" && v == "https://www.nexusmods.com/enshrouded/mods/1"),
         "{:?}",
         r.details
     );
-    assert!(r.details.iter().any(|l| l == "dllchain's name for it: xhl-core"), "{:?}", r.details);
+    assert!(r.details.iter().any(|(k, v)| k == "Short name" && v == "xhl-core"), "{:?}", r.details);
     assert_eq!(without_own(&snapshot(&dir)), files);
     // the same name again changes nothing; an empty one gives the DLL's own name back
     assert!(plan_rename(&c, "xhl-core", Some("Extra HUD Lines")).unwrap().is_empty());
@@ -492,5 +492,55 @@ fn rename_changes_only_the_name() {
     install(&c, &src("alp.zip", alp2(), &[]));
     assert_eq!(name(&c, "dinput8.dll").name, "ALP");
     assert!(plan_rename(&c, "nobody", Some("x")).is_err());
+    clean(&dir);
+}
+
+#[test]
+fn the_plan_and_the_details_in_plain_words() {
+    let dir = game("words");
+    let c = ctx(&dir);
+    install(&c, &src("xhl.zip", xhl(), &[]));
+    let files: [(&str, &[u8]); 4] = [
+        (r"mods\auto-loot-plus\mod.lua", b"m"),
+        (r"mods\auto-loot-plus\config.txt", b"c"),
+        (r"mods\auto-loot-plus\items.txt", b"i"),
+        (r"licenses\LICENSE.txt", b"l"),
+    ];
+    let p = plan_install(&c, &src("AutoLootPlus 1.1.8\\", alp(), &files)).unwrap();
+    assert_eq!(p.name, "Auto Loot Plus");
+    assert_eq!(
+        p.summary,
+        [
+            "XHL Core is renamed to xhl-core.dll and keeps working, started by Auto Loot Plus.",
+            "Auto Loot Plus becomes dinput8.dll. The game loads it, and it starts your other mods.",
+            r"4 more files go into the game folder, most of them in mods\auto-loot-plus\."
+        ],
+        "{:?}",
+        p.summary
+    );
+    assert!(p.files.contains(&"dinput8.dll renamed to xhl-core.dll".to_string()), "{:?}", p.files);
+    assert!(p.files.contains(&r"mods\auto-loot-plus\mod.lua (new)".to_string()), "{:?}", p.files);
+    assert!(p.files.iter().all(|f| !f.starts_with("dllchain")), "{:?}", p.files);
+    apply(&c, &p).unwrap();
+    let st = status(&c).unwrap();
+    let r = st.rows.iter().find(|r| r.file.as_str() == "dinput8.dll").unwrap();
+    assert_eq!(r.source, "AutoLootPlus 1.1.8\\");
+    let get = |k: &str| r.details.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
+    assert_eq!(get("File").as_deref(), Some("dinput8.dll (game loads it; starts others)"));
+    assert_eq!(get("From").as_deref(), Some("the folder \"AutoLootPlus 1.1.8\""));
+    assert_eq!(get("Web page").as_deref(), Some("not known"));
+    assert_eq!(get("Files added").as_deref(), Some(r"4, in mods\auto-loot-plus\ and licenses\"));
+    assert_eq!(get("SHA-256"), Some(sha256_hex(&alp())));
+    assert!(get("Installed").is_some_and(|t| t.contains(", ") && !t.contains('-')), "{:?}", r.details);
+
+    let p = plan_uninstall(&c, Some("auto-loot-plus")).unwrap();
+    assert_eq!(p.name, "Auto Loot Plus");
+    assert_eq!(
+        p.summary[0], "Auto Loot Plus is uninstalled: its dinput8.dll and 4 more files are deleted.",
+        "{:?}",
+        p.summary
+    );
+    assert!(p.summary.iter().any(|l| l.starts_with("XHL Core becomes dinput8.dll")), "{:?}", p.summary);
+    run(&c, Ok(p));
     clean(&dir);
 }

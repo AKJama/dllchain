@@ -15,6 +15,8 @@ Download the zip from the [releases](https://github.com/AKJama/dllchain/releases
 Close the game and Steam first; dllchain changes nothing while either runs.
 
 - **Install mod...** (or drop a mod's `.zip` or `dinput8.dll` on the window) adds a mod.
+  For a mod you already unpacked, pick its `dinput8.dll`: the files next to it (such as its `mods\` folder) are installed with it.
+  A folder that also holds programs or other archives, such as Downloads itself, is refused, so unpack each mod into a folder of its own.
 - **Uninstall** or **Uninstall all** take mods out again.
 - **Repair** fixes the chain after another mod's `dinput8.dll` was copied over a chained one.
 - **Rename** (or F2) changes the name a mod is shown under; no file is renamed.
@@ -24,7 +26,8 @@ Close the game and Steam first; dllchain changes nothing while either runs.
   dllchain never downloads or installs anything by itself.
 - Select a mod to see everything dllchain knows about it: when it was installed, from which file and website, its SHA-256 and the files it added.
 
-Every change is shown first and only made after you press OK.
+Every change is shown first, in plain words, and only made after you press Install, Uninstall or Repair.
+**Show details** in that question lists the mod's SHA-256 and every file that changes.
 The same actions are on the command line in `dllchain-cli.exe`:
 
 ```

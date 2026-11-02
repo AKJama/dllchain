@@ -95,21 +95,30 @@ pub fn describe(plan: &Plan) -> String {
     if plan.is_empty() {
         s.push_str("Nothing needs to change.\n");
     } else {
-        s.push_str("dllchain will:\n");
+        s.push_str("What changes in your game folder:\n");
         for l in &plan.summary {
             s.push_str(&format!("  - {l}\n"));
-        }
-    }
-    if !plan.replaces.is_empty() {
-        s.push_str("\nThese files were not installed by dllchain and will be replaced (a copy is kept in dllchain\\originals, and uninstalling puts them back):\n");
-        for r in &plan.replaces {
-            s.push_str(&format!("  - {r}\n"));
         }
     }
     if !plan.notes.is_empty() {
         s.push_str("\nGood to know:\n");
         for n in &plan.notes {
             s.push_str(&format!("  - {n}\n"));
+        }
+    }
+    s
+}
+
+/// A mod's details as aligned lines: the labels in one column, the values in the next. With `tab`, a tab goes
+/// between them instead, for a text box with a tab stop.
+pub fn details_text(details: &[(String, String)], tab: bool) -> String {
+    let width = details.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) + 4;
+    let mut s = String::new();
+    for (label, value) in details {
+        if tab {
+            s.push_str(&format!("{label}\t{value}\n"));
+        } else {
+            s.push_str(&format!("{label:width$}{value}\n"));
         }
     }
     s

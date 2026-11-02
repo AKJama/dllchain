@@ -6,7 +6,7 @@ mod update;
 use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source};
-use common::{GAME, Opts, describe, shown};
+use common::{GAME, Opts, describe, details_text, shown};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -150,7 +150,7 @@ fn print_status(ctx: &Ctx) -> Result<()> {
         let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());
         let word = r.word.as_deref().map_or(String::new(), |w| format!(" ({w})"));
         println!("\n{}{word}  {}  [{}]  SHA-256 {sha}", r.name, r.file, r.role);
-        for l in r.details.iter().skip(1) {
+        for l in details_text(&r.details, false).lines() {
             println!("    {l}");
         }
     }

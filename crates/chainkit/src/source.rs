@@ -1,4 +1,5 @@
-//! Reading the mod the player picked: a zip, or a DLL on its own. Nothing in it is run.
+//! Reading the mod the player picked: a zip, an unpacked mod folder (its `dinput8.dll` picked), or a DLL on its own.
+//! Nothing in it is run.
 
 use crate::dllinfo::inspect;
 use crate::game::Game;
@@ -14,9 +15,9 @@ pub const MAX_DLL: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ModSource {
-    /// The file name the player picked.
+    /// The file name the player picked; for an unpacked mod folder, the folder's name and a `\`.
     pub label: String,
-    /// The SHA-256 of that file, to compare with the one the mod's author publishes.
+    /// The SHA-256 of that file (of the DLL, for a folder), to compare with the one the mod's author publishes.
     pub sha256: String,
     /// A word from the file name, for a DLL that does not say who it is.
     pub word_hint: String,
@@ -39,6 +40,11 @@ pub fn read(path: &Path, game: &Game) -> Result<ModSource> {
         "dll" => {
             if meta.len() > MAX_DLL {
                 fail!("{label} is larger than {} MB, which no DLL mod is", MAX_DLL >> 20);
+            }
+            // a dinput8.dll with the rest of its mod around it: the folder is the mod
+            let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            if label.eq_ignore_ascii_case(game.host_dll) && has_other_files(dir, &label) {
+                return Ok(ModSource { from_url, ..read_folder(dir, game)? });
             }
             let dll = std::fs::read(path)?;
             inspect(&dll, game).map_err(|e| crate::Error(format!("{label}: {e}")))?;
@@ -105,7 +111,18 @@ fn read_zip(path: &Path, label: &str, game: &Game) -> Result<ModSource> {
         }
         entries.push((rel, data));
     }
+    let stem = Path::new(label).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    from_entries(entries, label, sha256, &stem, game)
+}
 
+/// The mod in a zip's or a folder's files: its one `dinput8.dll`, and the files next to it and below.
+fn from_entries(
+    entries: Vec<(RelPath, Vec<u8>)>,
+    label: &str,
+    sha256: String,
+    hint: &str,
+    game: &Game,
+) -> Result<ModSource> {
     let host = game.host_dll;
     let dlls: Vec<usize> =
         (0..entries.len()).filter(|&i| entries[i].0.file_name().eq_ignore_ascii_case(host)).collect();
@@ -141,8 +158,134 @@ fn read_zip(path: &Path, label: &str, game: &Game) -> Result<ModSource> {
             None => ignored.push(rel.to_string()),
         }
     }
-    let stem = Path::new(label).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    Ok(ModSource { label: label.to_string(), sha256, word_hint: word_hint(&stem), dll, files, ignored, from_url: None })
+    Ok(ModSource { label: label.to_string(), sha256, word_hint: word_hint(hint), dll, files, ignored, from_url: None })
+}
+
+/// Files Explorer keeps in folders by itself, never part of a mod.
+fn explorer_file(name: &str) -> bool {
+    ["desktop.ini", "thumbs.db"].contains(&name.to_lowercase().as_str())
+}
+
+/// Whether the folder of a picked `dinput8.dll` holds anything else: a mod unpacked there.
+fn has_other_files(dir: &Path, dll_name: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|list| {
+        list.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            !name.eq_ignore_ascii_case(dll_name) && !explorer_file(&name)
+        })
+    })
+}
+
+/// A `dinput8.dll` in an unpacked mod folder: the folder is the mod, as if it were the zip. Refused when the folder
+/// looks like more than one mod's files (programs or archives in it, or a folder like Downloads itself).
+fn read_folder(dir: &Path, game: &Game) -> Result<ModSource> {
+    let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let label = format!("{name}\\");
+    let own_folder = "Pick the mod's zip, or put the mod's files in a folder of their own first.";
+    if is_personal_folder(dir) {
+        fail!("{} is loose in {}, not in a folder of its own. {own_folder}", game.host_dll, dir.display());
+    }
+    let mut entries: Vec<(RelPath, Vec<u8>)> = Vec::new();
+    let mut total: u64 = 0;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let list = std::fs::read_dir(&d).map_err(|e| crate::Error(format!("could not read {}: {e}", d.display())))?;
+        let mut items = list.collect::<std::io::Result<Vec<_>>>()?;
+        // the same order every time, as in a zip
+        items.sort_by_key(|i| i.file_name());
+        for item in items {
+            let p = item.path();
+            let file = item.file_name().to_string_lossy().into_owned();
+            let meta = std::fs::symlink_metadata(&p)?;
+            if meta.file_type().is_symlink() || is_reparse_point(&meta) {
+                fail!("{name}: {file} is a link, which dllchain does not install");
+            }
+            if meta.is_dir() {
+                todo.push(p);
+                continue;
+            }
+            if explorer_file(&file) {
+                continue;
+            }
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if ["exe", "msi", "zip", "7z", "rar"].contains(&ext.as_str()) {
+                fail!("{name} also holds {file}, so it is not one mod's unpacked folder. {own_folder}");
+            }
+            if entries.len() >= MAX_FILES {
+                fail!("{name} has more than {MAX_FILES} files; that is not a DLL mod");
+            }
+            total += meta.len();
+            if total > MAX_TOTAL {
+                fail!("{name} holds more than {} MB; that is not a DLL mod", MAX_TOTAL >> 20);
+            }
+            let rel = p.strip_prefix(dir).map_err(|_| crate::Error(format!("{name}: {file} is outside it")))?;
+            let rel = RelPath::parse(&rel.to_string_lossy())
+                .map_err(|e| crate::Error(format!("{name} has a file dllchain cannot install safely: {e}")))?;
+            entries.push((rel, std::fs::read(&p)?));
+        }
+    }
+    let mut s = from_entries(entries, &label, String::new(), &name, game)?;
+    s.sha256 = sha256_hex(&s.dll);
+    Ok(s)
+}
+
+/// Drive roots and the player's own folders, where loose files are not one mod.
+fn is_personal_folder(dir: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    let Some(d) = real(dir) else { return false };
+    d.parent().is_none() || personal_folders().iter().any(|f| real(f).is_some_and(|f| f == d))
+}
+
+/// The profile folder, Downloads, Desktop and Documents, wherever Windows keeps them.
+fn personal_folders() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) {
+        for sub in ["Downloads", "Desktop", "Documents", r"OneDrive\Desktop", r"OneDrive\Documents"] {
+            out.push(home.join(sub));
+        }
+        out.push(home);
+    }
+    out.extend(known_folders());
+    out
+}
+
+#[cfg(windows)]
+fn known_folders() -> Vec<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Profile, SHGetKnownFolderPath,
+    };
+    let mut out = Vec::new();
+    for id in [FOLDERID_Downloads, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Profile] {
+        let mut p = std::ptr::null_mut();
+        // SAFETY: a known folder's id; the path Windows returns is read up to its NUL and freed with CoTaskMemFree.
+        unsafe {
+            if SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut p) == 0 && !p.is_null() {
+                let n = (0..).take_while(|&i| *p.add(i) != 0).count();
+                out.push(std::path::PathBuf::from(String::from_utf16_lossy(std::slice::from_raw_parts(p, n))));
+            }
+            CoTaskMemFree(p as *const std::ffi::c_void);
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn known_folders() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_REPARSE_POINT: junctions and other links
+    meta.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// The web page or address a downloaded file came from. Browsers save it next to the file, in the
@@ -291,7 +434,67 @@ mod tests {
         std::fs::write(&p, fake_dll(&[], None)).unwrap();
         let s = read(&p, &ENSHROUDED).unwrap();
         assert_eq!(s.word_hint, "some-mod");
+        assert_eq!(s.label, "Some Mod\\dinput8.dll");
         assert!(s.files.is_empty());
+        // Explorer's own files do not make it a mod folder
+        std::fs::write(dir.join("desktop.ini"), "[.ShellClassInfo]").unwrap();
+        assert_eq!(read(&p, &ENSHROUDED).unwrap().label, "Some Mod\\dinput8.dll");
+    }
+
+    #[test]
+    fn an_unpacked_mod_folder() {
+        let dir = tmp("AutoLootPlus 1.1.8 170");
+        let dll = fake_dll(&["auto-loot-plus"], None);
+        std::fs::create_dir_all(dir.join("mods\\auto-loot-plus")).unwrap();
+        std::fs::create_dir_all(dir.join("licenses")).unwrap();
+        std::fs::write(dir.join("dinput8.dll"), &dll).unwrap();
+        std::fs::write(dir.join("mods\\auto-loot-plus\\mod.lua"), "m").unwrap();
+        std::fs::write(dir.join("mods\\auto-loot-plus\\config.txt"), "c").unwrap();
+        std::fs::write(dir.join("licenses\\LICENSE.txt"), "l").unwrap();
+        std::fs::write(dir.join("Thumbs.db"), "t").unwrap();
+        let s = read(&dir.join("dinput8.dll"), &ENSHROUDED).unwrap();
+        assert_eq!(s.label, "AutoLootPlus 1.1.8 170\\");
+        assert_eq!(s.sha256, sha256_hex(&dll));
+        assert_eq!(s.dll, dll);
+        let mut names: Vec<&str> = s.files.iter().map(|f| f.0.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["licenses\\LICENSE.txt", "mods\\auto-loot-plus\\config.txt", "mods\\auto-loot-plus\\mod.lua"]
+        );
+        assert!(s.ignored.is_empty());
+    }
+
+    #[test]
+    fn refuses_folders_that_are_not_one_mod() {
+        let dll = fake_dll(&[], None);
+        let cases: [(&str, &str); 4] =
+            [("dl-exe", "setup.exe"), ("dl-zip", "Other Mod.zip"), ("dl-7z", "x.7z"), ("dl-game", "enshrouded.kfc")];
+        for (name, other) in cases {
+            let dir = tmp(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("dinput8.dll"), &dll).unwrap();
+            std::fs::write(dir.join("notes.txt"), "n").unwrap();
+            std::fs::write(dir.join(other), "x").unwrap();
+            let e = read(&dir.join("dinput8.dll"), &ENSHROUDED).unwrap_err();
+            assert!(e.0.contains(other) || e.0.contains("game data"), "{name}: {}", e.0);
+        }
+        // a second dinput8.dll below: which is the mod?
+        let dir = tmp("dl-two");
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        std::fs::write(dir.join("dinput8.dll"), &dll).unwrap();
+        std::fs::write(dir.join("old\\dinput8.dll"), &dll).unwrap();
+        assert!(read(&dir.join("dinput8.dll"), &ENSHROUDED).is_err());
+    }
+
+    #[test]
+    fn the_players_own_folders_are_not_a_mod() {
+        let home = std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+        assert!(is_personal_folder(&home));
+        assert!(is_personal_folder(&home.join("Downloads")) || !home.join("Downloads").exists());
+        let root = home.ancestors().last().unwrap();
+        assert!(is_personal_folder(root));
+        assert!(!is_personal_folder(&std::env::temp_dir()));
     }
 
     #[test]

@@ -9,7 +9,7 @@ mod update;
 use chainkit::engine::{Ctx, Plan, Row, plan_install, plan_rename, plan_repair, plan_uninstall, status};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source, steam};
-use common::{GAME, Opts, describe, shown};
+use common::{GAME, Opts, describe, details_text, shown};
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -26,12 +26,14 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
-    EM_GETLINECOUNT, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT,
-    LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_EDITLABELW, LVM_GETEDITCONTROL,
-    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMTEXTW, LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EDITLABELS,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NMHDR,
-    NMLISTVIEW, NMLVDISPINFOW, SetWindowTheme, ShowScrollBar,
+    EM_GETLINECOUNT, EM_SETTABSTOPS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
+    LVM_EDITLABELW, LVM_GETEDITCONTROL, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVN_BEGINLABELEDITW, LVN_ENDLABELEDITW, LVN_ITEMCHANGED,
+    LVNI_SELECTED, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NM_DBLCLK, NMHDR, NMLISTVIEW, NMLVDISPINFOW, SetWindowTheme, ShowScrollBar, TASKDIALOG_BUTTON,
+    TASKDIALOGCONFIG, TD_WARNING_ICON, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+    TDF_POSITION_RELATIVE_TO_WINDOW, TaskDialogIndirect,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -39,8 +41,8 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::Shell::{
-    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DragAcceptFiles, DragFinish, DragQueryFileW, HDROP,
-    SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW,
+    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DragAcceptFiles, DragFinish, DragQueryFileW,
+    FOLDERID_Downloads, HDROP, SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -204,6 +206,10 @@ fn create_controls(main: HWND) {
     };
     CTL.with(|x| x.set(Some(c)));
     set_fonts(&c);
+    // the details' labels in one column, their values from here on (in dialog units, so it follows the font)
+    let stop: u32 = 64;
+    // SAFETY: our edit control; it copies the tab stop.
+    unsafe { SendMessageW(c.log, EM_SETTABSTOPS, 1, (&raw const stop) as isize) };
     let ex = (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize;
     let explorer = wide("Explorer");
     // SAFETY: our list view; each column text is copied by the control.
@@ -327,7 +333,7 @@ fn show_selection() {
     unsafe { EnableWindow(ctl().buttons[2], r.as_ref().is_some_and(|r| r.page.is_some()) as i32) };
     match r {
         Some(r) => {
-            let mut t = r.details.join("\n");
+            let mut t = format!("{}\n{}", r.name, details_text(&r.details, true).trim_end());
             if r.word.is_some() {
                 t.push_str("\n\nTo give it another name, click Rename or press F2.");
             }
@@ -402,7 +408,7 @@ fn refresh(msg: &str) {
         SendMessageW(c.list, LVM_DELETEALLITEMS, 0, 0);
         for (i, r) in rows.iter().enumerate() {
             let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());
-            let at = r.at.split(' ').next().unwrap_or_default().to_string();
+            let at = chainkit::clock::readable(&r.at).split(',').next().unwrap_or_default().to_string();
             let cells = [r.name.clone(), r.file.to_string(), r.role.clone(), at, sha, r.source.clone()];
             for (k, cell) in cells.iter().enumerate() {
                 let mut text = wide(cell);
@@ -454,18 +460,24 @@ fn act(a: Action) {
         for n in &recovered {
             head.push_str(&format!("{n}\n"));
         }
-        let (plan, title, intro): (Plan, String, String) = match &a {
+        // the plan, the mod's SHA-256 line for the details, and the intro for the message pane
+        let (plan, sha, intro): (Plan, String, String) = match &a {
             Action::Install(p) => {
                 let src = source::read(p, GAME)?;
-                let intro = format!(
-                    "{}\nSHA-256 {}\nCompare it with the SHA-256 the mod's author publishes.\n\n",
-                    src.label, src.sha256
+                let what = match src.label.strip_suffix('\\') {
+                    Some(folder) => format!("{} in the folder \"{folder}\"", GAME.host_dll),
+                    None => src.label.clone(),
+                };
+                let sha = format!(
+                    "SHA-256 of {what}:\n{}\nCompare it with the SHA-256 on the mod's page, when it has one.",
+                    src.sha256
                 );
-                (plan_install(&ctx, &src)?, format!("Install {}", src.label), intro)
+                let intro = format!("{}\nSHA-256 {}\n\n", src.label, src.sha256);
+                (plan_install(&ctx, &src)?, sha, intro)
             }
-            Action::Uninstall(w) => (plan_uninstall(&ctx, w.as_deref())?, "Uninstall".into(), String::new()),
-            Action::Repair => (plan_repair(&ctx)?, "Repair".into(), String::new()),
-            Action::Rename(w, n) => (plan_rename(&ctx, w, Some(n))?, "Rename".into(), String::new()),
+            Action::Uninstall(w) => (plan_uninstall(&ctx, w.as_deref())?, String::new(), String::new()),
+            Action::Repair => (plan_repair(&ctx)?, String::new(), String::new()),
+            Action::Rename(w, n) => (plan_rename(&ctx, w, Some(n))?, String::new(), String::new()),
         };
         let words = describe(&plan);
         if plan.is_empty() {
@@ -476,14 +488,14 @@ fn act(a: Action) {
             o.apply(&ctx, &plan)?;
             return Ok(format!("{head}Done: {}", plan.summary.join("\n")));
         }
-        let icon = if plan.replaces.is_empty() { MB_ICONQUESTION } else { MB_ICONWARNING };
-        if message(&format!("dllchain - {title}"), &format!("{intro}{words}\nGo ahead?"), MB_OKCANCEL | icon) != IDOK {
+        if !confirm(&a, &plan, &sha) {
             return Ok(format!("{head}Nothing was changed."));
         }
         let mut out = head;
         for l in o.apply(&ctx, &plan)? {
             out.push_str(&format!("{l}\n"));
         }
+        let words = words.replacen("What changes in", "What changed in", 1);
         out.push_str(&format!("{intro}{words}\nDone. Every change is in dllchain\\installer.log in the game folder."));
         Ok(out)
     })();
@@ -496,15 +508,109 @@ fn act(a: Action) {
     }
 }
 
+/// The file list in the details is cut here; the log has every change.
+const MAX_LISTED: usize = 40;
+
+/// Asks before a change, in plain words: what changes in the game folder, and under "Show details" the mod's SHA-256
+/// and every file. True when the player said yes.
+fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
+    let name = if plan.name.is_empty() { None } else { Some(plan.name.as_str()) };
+    let (verb, question) = match (a, name) {
+        (Action::Install(_), Some(n)) => ("Install", format!("Install {n}?")),
+        (Action::Install(_), None) => ("Install", "Install this mod?".to_string()),
+        (Action::Uninstall(Some(_)), Some(n)) => ("Uninstall", format!("Uninstall {n}?")),
+        (Action::Uninstall(_), _) => ("Uninstall", "Uninstall every mod dllchain installed?".to_string()),
+        _ => ("Repair", "Repair the chain?".to_string()),
+    };
+    let mut content = String::from("What changes in your game folder:\n");
+    for l in &plan.summary {
+        content.push_str(&format!("\u{2022} {l}\n"));
+    }
+    if !plan.notes.is_empty() {
+        content.push_str("\nGood to know:\n");
+        for n in &plan.notes {
+            content.push_str(&format!("\u{2022} {n}\n"));
+        }
+    }
+    if plan.first_install {
+        content.push_str("\nBefore this first install, dllchain copies your saves, as EMF does.");
+    }
+    if let Action::Install(_) = a {
+        content.push_str("\nYou can undo all of this with Uninstall.");
+    }
+    let mut details = String::new();
+    if !sha.is_empty() {
+        details.push_str(&format!("{sha}\n\n"));
+    }
+    details.push_str("Files in the game folder:\n");
+    for f in plan.files.iter().take(MAX_LISTED) {
+        details.push_str(&format!("{f}\n"));
+    }
+    if plan.files.len() > MAX_LISTED {
+        details.push_str(&format!(
+            "and {} more; dllchain\\installer.log lists them all after the change.\n",
+            plan.files.len() - MAX_LISTED
+        ));
+    }
+    let (title, main, text, more) =
+        (wide("dllchain"), wide(&question), wide(&crlf(content.trim_end())), wide(&crlf(details.trim_end())));
+    let (show, hide, go) = (wide("Show details"), wide("Hide details"), wide(&format!("&{verb}")));
+    const ID_GO: i32 = 100;
+    let buttons = [TASKDIALOG_BUTTON { nButtonID: ID_GO, pszButtonText: go.as_ptr() }];
+    let mut pressed = 0;
+    // SAFETY: TASKDIALOGCONFIG is plain data; every string and the button array outlive the call.
+    let ok = unsafe {
+        let mut tc: TASKDIALOGCONFIG = std::mem::zeroed();
+        tc.cbSize = size_of::<TASKDIALOGCONFIG>() as u32;
+        tc.hwndParent = ctl().main;
+        tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+        tc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+        tc.pszWindowTitle = title.as_ptr();
+        if !plan.replaces.is_empty() {
+            tc.Anonymous1.pszMainIcon = TD_WARNING_ICON;
+        }
+        tc.pszMainInstruction = main.as_ptr();
+        tc.pszContent = text.as_ptr();
+        tc.cButtons = buttons.len() as u32;
+        tc.pButtons = buttons.as_ptr();
+        tc.nDefaultButton = ID_GO;
+        tc.pszExpandedInformation = more.as_ptr();
+        tc.pszExpandedControlText = hide.as_ptr();
+        tc.pszCollapsedControlText = show.as_ptr();
+        TaskDialogIndirect(&tc, &mut pressed, null_mut(), null_mut())
+    };
+    ok == 0 && pressed == ID_GO
+}
+
+/// The player's Downloads folder, where a mod usually is.
+fn downloads() -> Option<Vec<u16>> {
+    let mut p = null_mut();
+    // SAFETY: a known folder's id; the path Windows returns is copied up to its NUL and freed with CoTaskMemFree.
+    unsafe {
+        let found = SHGetKnownFolderPath(&FOLDERID_Downloads, 0, null_mut(), &mut p) == 0 && !p.is_null();
+        let path = found.then(|| {
+            let n = (0..).take_while(|&i| *p.add(i) != 0).count();
+            std::slice::from_raw_parts(p, n).iter().copied().chain([0]).collect()
+        });
+        CoTaskMemFree(p as *const c_void);
+        path
+    }
+}
+
 fn pick_mod() -> Option<PathBuf> {
     let filter: Vec<u16> = "Mod zip or DLL (*.zip, *.dll)\0*.zip;*.dll\0".encode_utf16().chain([0]).collect();
     let title = wide("Pick a mod's zip or its dinput8.dll");
     let mut buf = vec![0u16; 4096];
+    let start = downloads();
     // SAFETY: OPENFILENAMEW is plain data; every pointer in it outlives the call.
     unsafe {
         let mut ofn: OPENFILENAMEW = std::mem::zeroed();
         ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
         ofn.hwndOwner = ctl().main;
+        // Downloads the first time; after that Windows starts where the player last picked a mod
+        if let Some(s) = &start {
+            ofn.lpstrInitialDir = s.as_ptr();
+        }
         ofn.lpstrFilter = filter.as_ptr();
         ofn.lpstrFile = buf.as_mut_ptr();
         ofn.nMaxFile = buf.len() as u32;
