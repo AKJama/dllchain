@@ -12,7 +12,7 @@ use crate::game::{Game, Requirement};
 use crate::hash::{sha256_hex, short};
 use crate::paths::{RelPath, is_word, resolve};
 use crate::record::{FileRec, Kind, ModRec, RECORD, Record, clean_name, store_rel};
-use crate::source::{ModSource, check_target};
+use crate::source::{ModSource, check_target, release_extra};
 use crate::steam::is_game_folder;
 use crate::txn::{Txn, recover};
 use crate::{Error, OWN_DIR, Result, clock, fail};
@@ -296,8 +296,8 @@ struct Work<'a> {
     mods: Vec<ModRec>,
     dlls: HashMap<String, Vec<u8>>,
     plan: Plan,
-    /// DLL files to delete before anything moves: (where, its SHA-256).
-    drop: Vec<(RelPath, String)>,
+    /// DLL files to delete before anything moves: (where, its SHA-256, the mod whose DLL it is or was).
+    drop: Vec<(RelPath, String, String)>,
     /// The mod whose chain line is switched on even if the player switched it off (the one being installed).
     switch_on: Option<String>,
     /// Uninstalling everything: several mods that cannot host are left as they are, not refused.
@@ -381,7 +381,7 @@ impl<'a> Work<'a> {
                 self.display(installing.unwrap_or_default())
             ));
             self.plan.summary.push("dllchain keeps the older copy, and Uninstall puts it back.".into());
-            self.drop.push((host, info.sha256.clone()));
+            self.drop.push((host, info.sha256.clone(), installing.unwrap_or_default().to_string()));
             self.write_store(installing.unwrap_or_default(), bytes);
             return Some(info.sha256.clone());
         }
@@ -389,7 +389,7 @@ impl<'a> Work<'a> {
             let old = self.mods[i].clone();
             if let Some(at) = locate(self.ctx, self.scan, &old) {
                 if !at.same(&host) {
-                    self.drop.push((at.clone(), old.dll_sha.clone()));
+                    self.drop.push((at.clone(), old.dll_sha.clone(), old.word.clone()));
                 }
             }
             self.plan.summary.push(format!(
@@ -459,17 +459,24 @@ impl<'a> Work<'a> {
             .collect();
         let located: Vec<Option<RelPath>> = self.mods.iter().map(|m| locate(ctx, self.scan, m)).collect();
         // a DLL of ours that goes before anything moves (only while it is still the one dllchain means)
-        let dropping = |r: &RelPath, drop: &[(RelPath, String)]| {
-            drop.iter().any(|(d, s)| d.same(r) && ctx.sha(r).as_deref() == Some(s.as_str()))
+        let dropping = |r: &RelPath, drop: &[(RelPath, String, String)]| {
+            drop.iter().any(|(d, s, _)| d.same(r) && ctx.sha(r).as_deref() == Some(s.as_str()))
         };
+        // the mod whose DLL is dinput8.dll now, and stays there unless another mod takes its place
         let holder =
             (0..n).find(|&i| located[i].as_ref().is_some_and(|l| l.same(&host)) && !dropping(&host, &self.drop));
+        // the mod that hosts now: also one being updated, whose older DLL there goes for the new one
+        let current = holder.or_else(|| {
+            let (_, _, word) =
+                self.drop.iter().find(|(d, s, _)| d.same(&host) && ctx.sha(&host).as_deref() == Some(s.as_str()))?;
+            self.mods.iter().position(|m| &m.word == word)
+        });
 
         let host_i = if emf || n == 0 {
             None
         } else if n == 1 {
             Some(0)
-        } else if let Some(h) = holder.filter(|&h| can_host[h]) {
+        } else if let Some(h) = current.filter(|&h| can_host[h]) {
             Some(h)
         } else if let Some(h) = (0..n).filter(|&i| can_host[i]).max_by_key(|&i| self.mods[i].order) {
             Some(h)
@@ -558,7 +565,7 @@ impl<'a> Work<'a> {
             let b = self.dlls[&w].clone();
             self.write_store(&w, &b);
         }
-        for (r, sha) in self.drop.clone() {
+        for (r, sha, _) in self.drop.clone() {
             if ctx.sha(&r).as_deref() == Some(sha.as_str()) {
                 self.plan.steps.push(Step::Delete(r.clone()));
                 self.plan.expect_files.push((r, None));
@@ -797,7 +804,7 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
             } else {
                 w.plan.summary.push(format!("{display} will be updated to the new version."));
                 if let Some(at) = locate(ctx, &scan, &old) {
-                    w.drop.push((at, old.dll_sha.clone()));
+                    w.drop.push((at, old.dll_sha.clone(), word.clone()));
                 }
             }
             let mut r = old.clone();
@@ -858,6 +865,16 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     w.plan.summary.extend(file_lines);
     for i in &src.ignored {
         w.plan.notes.push(format!("{i} is outside the mod's folder in the zip, so it is not installed"));
+    }
+    if !src.extras.is_empty() {
+        let k = src.extras.len();
+        let list = match k {
+            1..=4 => src.extras.join(", "),
+            _ => format!("{} and {} more", src.extras[..3].join(", "), k - 3),
+        };
+        w.plan.notes.push(format!(
+            "Licence, checksum and read-me files are for you, not the game, so they stay out of the game folder: {list}"
+        ));
     }
     let files: Vec<&RelPath> = src.files.iter().map(|(r, _)| r).collect();
     w.plan.missing = missing(ctx, &scan, &files);
@@ -928,11 +945,30 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
     }
     let new_count = files.len();
     let mut undone = Undone::default();
+    // Only a version that ships the mod's files can leave one out. A new DLL on its own (a fix, often downloaded
+    // without the rest) keeps the files the earlier version installed; so does a licence or read-me the earlier
+    // version put next to the game, which dllchain no longer installs.
+    let dll_only = src.files.is_empty();
+    let mut carried: Vec<&RelPath> = Vec::new();
     for p in &prev_files {
         if files.iter().any(|f| f.rel.same(&p.rel)) {
             continue;
         }
+        if dll_only || release_extra(&p.rel) {
+            files.push(p.clone());
+            carried.push(&p.rel);
+            continue;
+        }
         undone.add(undo_file(w, p, &mut files), p);
+    }
+    if dll_only {
+        match carried.len() {
+            0 => {}
+            1 => w.plan.summary.push(format!("Keeps {} from the earlier version.", carried[0])),
+            k => {
+                w.plan.summary.push(format!("Keeps the other {k} files from the earlier version{}.", most_in(&carried)))
+            }
+        }
     }
     let created: Vec<&RelPath> = files[..new_count.min(files.len())]
         .iter()
@@ -1187,7 +1223,7 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
         }
         undone.words(&mut w);
         if let Some(at) = at {
-            w.drop.push((at, m.dll_sha.clone()));
+            w.drop.push((at, m.dll_sha.clone(), m.word.clone()));
         }
         let mut dirs = m.dirs.clone();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.as_str().matches('\\').count()));

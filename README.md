@@ -16,7 +16,8 @@ Close the game and Steam first; dllchain changes nothing while either runs.
 
 - **Install mod...** (or drop a mod's `.zip` or `dinput8.dll` on the window) adds a mod.
   For a mod you already unpacked, pick its `dinput8.dll`: the files next to it (such as its `mods\` folder) are installed with it.
-  A folder that also holds programs or other archives, such as Downloads itself, is refused, so unpack each mod into a folder of its own.
+  A folder that also holds programs, archives, pictures or documents, such as Downloads itself, is refused, so unpack each mod into a folder of its own.
+  Licence, checksum and read-me files next to the mod's `dinput8.dll` (such as `SHA256SUMS.txt`) are for you, not the game, so they are never copied into the game folder.
   When the mod is also a script package for the [Enshrouded Mod Loader (EML)](https://brabb3l.github.io/kfc-parser/eml/usage.html) (it ships `mods\<name>\mod.json`) and EML is not installed, dllchain says so, with a link to EML's page.
   It installs the mod anyway and never downloads EML itself.
 - **Uninstall** or **Uninstall all** take mods out again.
@@ -25,6 +26,7 @@ Close the game and Steam first; dllchain changes nothing while either runs.
 - **Rename** (or F2) changes the name a mod is shown under; no file is renamed.
 - **Mod page** opens the page the selected mod was downloaded from, when Windows noted one.
   To update a mod, download the new zip there and install it over the old one: it keeps its place in the chain, and uninstalling still gives back what was there before.
+  An update that is only the new `dinput8.dll` keeps the mod's other files from the earlier version; only a full new version can leave files out, and the question says which go.
 - **Help > Check for updates** asks GitHub whether a newer dllchain is out and offers to open its page.
   dllchain never downloads or installs anything by itself.
 - Select a mod to see everything dllchain knows about it: when it was installed, from which file and website, its SHA-256 and the files it added.

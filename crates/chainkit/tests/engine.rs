@@ -88,6 +88,7 @@ fn src(label: &str, dll: Vec<u8>, files: &[(&str, &[u8])]) -> ModSource {
         dll,
         files: files.iter().map(|(n, b)| (RelPath::parse(n).unwrap(), b.to_vec())).collect(),
         ignored: Vec::new(),
+        extras: Vec::new(),
         from_url: None,
     }
 }
@@ -223,6 +224,79 @@ fn an_updated_guest_keeps_its_file_name() {
     assert!(!dir.join("xhl-core-2.dll").exists());
     assert_eq!(chain(&dir), vec![("xhl-core.dll".to_string(), true)]);
     assert!(plan_repair(&c).unwrap().is_empty());
+}
+
+#[test]
+fn a_dll_only_update_keeps_the_mods_files_and_its_place() {
+    // Auto Loot Plus installed in full, then a mod that can also host, then a fix shipped as the DLL alone
+    let dir = game("dll-only");
+    let c = ctx(&dir);
+    let full = [
+        ("AutoLootPlus-README.txt", b"read me" as &[u8]),
+        ("mods\\alp\\config.txt", b"v1"),
+        ("mods\\alp\\mod.lua", b"lua"),
+        ("licenses\\ALP-LICENSE.txt", b"mit"),
+    ];
+    install(&c, &src("alp-fix1\\", alp(), &full));
+    install(&c, &src("shiny.zip", shiny(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    let before = without_own(&snapshot(&dir));
+    let p = install(&c, &src("alp-fix2\\dinput8.dll", alp2(), &[]));
+    assert_eq!(
+        p.summary,
+        vec!["Auto Loot Plus will be updated to the new version.", "Keeps the other 4 files from the earlier version."]
+    );
+    assert_eq!(p.files, vec!["dinput8.dll (replaced)"]);
+    // the host stays the host, and every other file is as it was
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp2()));
+    assert_eq!(chain(&dir), vec![("shiny-mod.dll".to_string(), true)]);
+    let mut after = without_own(&snapshot(&dir));
+    after.insert("dinput8.dll".into(), alp());
+    assert_eq!(after, before);
+    assert!(plan_repair(&c).unwrap().is_empty());
+    // the files are still the mod's: a full version can leave some out, and uninstall takes them all
+    let p = install(&c, &src("alp-fix3\\", alp(), &full[1..2]));
+    assert!(p.summary.iter().any(|l| l == "Deletes 2 files the new version does not have."), "{:?}", p.summary);
+    assert!(!dir.join("mods\\alp\\mod.lua").exists() && !dir.join("licenses\\ALP-LICENSE.txt").exists());
+    // a read-me the earlier version put next to the game is not taken for something the new one leaves out
+    assert_eq!(read(&dir, "AutoLootPlus-README.txt"), Some(b"read me".to_vec()));
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(
+        snapshot(&dir).into_keys().collect::<Vec<_>>(),
+        vec!["enshrouded.exe".to_string(), "steam_api64.dll".to_string()]
+    );
+}
+
+#[test]
+fn an_updated_host_stays_the_host_whatever_the_order() {
+    // the guest came later, so it is the newest mod that can host; the host still keeps its place
+    let cases: [&[(&str, &[u8])]; 2] = [&[], &[("mods\\alp\\config.txt", b"v2")]];
+    for (i, files) in cases.iter().enumerate() {
+        let dir = game(&format!("host-update{i}"));
+        let c = ctx(&dir);
+        install(&c, &src("alp.zip", alp(), &[("mods\\alp\\config.txt", b"v1")]));
+        install(&c, &src("shiny.zip", shiny(), &[]));
+        let p = install(&c, &src("alp.zip", alp2(), files));
+        assert_eq!(read(&dir, "dinput8.dll"), Some(alp2()), "{:?}", p.files);
+        assert_eq!(read(&dir, "shiny-mod.dll"), Some(shiny()));
+        assert_eq!(chain(&dir), vec![("shiny-mod.dll".to_string(), true)]);
+        assert!(!dir.join("auto-loot-plus.dll").exists());
+        assert!(plan_repair(&c).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn release_extras_are_named_and_never_installed() {
+    let dir = game("extras");
+    let c = ctx(&dir);
+    let mut s = src("alp-fix2\\dinput8.dll", alp(), &[]);
+    s.extras = ["AutoLootPlus-LICENSE.txt", "DearImGui-LICENSE.txt", "SHA256SUMS.txt", "Vulkan-Headers-LICENSE.md"]
+        .map(String::from)
+        .to_vec();
+    let p = install(&c, &s);
+    let list = "AutoLootPlus-LICENSE.txt, DearImGui-LICENSE.txt, SHA256SUMS.txt, Vulkan-Headers-LICENSE.md";
+    assert!(p.notes.iter().any(|n| n.ends_with(&format!("stay out of the game folder: {list}"))), "{:?}", p.notes);
+    assert_eq!(p.files, vec!["dinput8.dll (new)"]);
 }
 
 #[test]
