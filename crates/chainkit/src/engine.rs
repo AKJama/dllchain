@@ -310,9 +310,10 @@ impl<'a> Work<'a> {
         let word = info.word.as_ref().map(|w| w.0.clone());
         if word.is_some() && word.as_deref() == installing {
             self.plan.summary.push(format!(
-                "{host} is an earlier copy of {}: the new one takes its place (dllchain keeps the old one, and Uninstall puts it back).",
+                "The new {} takes the place of the older copy in your game.",
                 self.display(installing.unwrap_or_default())
             ));
+            self.plan.summary.push("dllchain keeps the older copy, and Uninstall puts it back.".into());
             self.drop.push((host, info.sha256.clone()));
             self.write_store(installing.unwrap_or_default(), bytes);
             return Some(info.sha256.clone());
@@ -325,10 +326,8 @@ impl<'a> Work<'a> {
                 }
             }
             self.plan.summary.push(format!(
-                "{host} is a newer copy of {}: dllchain uses it from now on, in place of the one it had (SHA-256 {}, was {}).",
-                self.display(&old.word),
-                short(&info.sha256),
-                short(&old.dll_sha)
+                "The {} in your game is newer than dllchain's copy, so dllchain uses it from now on.",
+                self.display(&old.word)
             ));
             let m = &mut self.mods[i];
             m.dll_sha = info.sha256.clone();
@@ -338,7 +337,7 @@ impl<'a> Work<'a> {
         }
         let w = self.unique_word(&word.unwrap_or_else(|| "dinput8-previous".into()));
         let name = default_name(info).unwrap_or_else(|| self.display(&w));
-        self.plan.summary.push(format!("{name} is already {host}: dllchain keeps a copy of it and never deletes it."));
+        self.plan.summary.push(format!("{name} is already in your game and keeps working."));
         let order = self.next_order();
         self.mods.push(ModRec {
             word: w.clone(),
@@ -357,6 +356,14 @@ impl<'a> Work<'a> {
         });
         self.dlls.insert(w, bytes.clone());
         None
+    }
+
+    /// "enstash keeps working.", unless a line already says what happens to that mod.
+    fn keeps_working(&mut self, name: &str) {
+        let start = format!("{name} ");
+        if !self.plan.summary.iter().any(|l| l.starts_with(&start)) {
+            self.plan.summary.push(format!("{name} keeps working."));
+        }
     }
 
     fn next_order(&self) -> u32 {
@@ -399,9 +406,9 @@ impl<'a> Work<'a> {
         } else if self.allow_no_host {
             let h = (0..n).max_by_key(|&i| self.mods[i].order).unwrap_or(0);
             self.plan.notes.push(format!(
-                "None of {} can start the others, so only {} runs; the others stay renamed (not deleted).",
-                self.mods.iter().map(|m| self.display(&m.word)).collect::<Vec<_>>().join(", "),
-                self.display(&self.mods[h].word)
+                "Only {} will run: none of {} can start the others. The others stay in the game folder.",
+                self.display(&self.mods[h].word),
+                self.mods.iter().map(|m| self.display(&m.word)).collect::<Vec<_>>().join(", ")
             ));
             Some(h)
         } else {
@@ -412,12 +419,6 @@ impl<'a> Work<'a> {
                 ctx.game.host_dll
             );
         };
-        // who starts the guests, and whether the host has any to start
-        let starter = match host_i {
-            Some(h) => self.display(&self.mods[h].word),
-            None => "EMF".to_string(),
-        };
-        let starts = if n > 1 && host_i.is_some_and(|h| can_host[h]) { ", and it starts your other mods" } else { "" };
         if let Some(h) = host_i {
             if !can_host[h] {
                 let others: Vec<String> = self
@@ -429,9 +430,8 @@ impl<'a> Work<'a> {
                     .collect();
                 if !others.is_empty() {
                     self.plan.notes.push(format!(
-                        "{} cannot read {}, so the DLLs listed there by others do not start: {}",
+                        "{} cannot start other mods, so these will not run: {}",
                         self.display(&self.mods[h].word),
-                        ctx.game.chain_file,
                         others.join(", ")
                     ));
                 }
@@ -502,9 +502,7 @@ impl<'a> Work<'a> {
                     self.plan.steps.push(Step::Delete(host.clone()));
                 } else {
                     self.plan.steps.push(Step::Rename(host.clone(), targets[h].clone()));
-                    self.plan
-                        .summary
-                        .push(format!("{w} is renamed to {} and keeps working, started by {starter}.", targets[h]));
+                    self.keeps_working(&w);
                 }
                 moved_from.push(host.clone());
             }
@@ -532,19 +530,17 @@ impl<'a> Work<'a> {
             {
                 self.plan.steps.push(Step::Rename(l.clone(), t.clone()));
                 moved_from.push(l.clone());
-                self.plan.summary.push(if t.same(&host) {
-                    format!("{w} becomes {host} (it was {l}). The game loads it{starts}.")
-                } else {
-                    format!("{w} is renamed from {l} to {t} and keeps working, started by {starter}.")
-                });
+                self.keeps_working(&w);
             } else {
                 self.plan.steps.push(Step::Write(t.clone(), self.dlls[&self.mods[i].word].clone()));
-                let was_here = self.scan.record.mods.iter().any(|m| m.word == self.mods[i].word && m.dll_sha == sha);
-                self.plan.summary.push(match (t.same(&host), was_here) {
-                    (true, false) => format!("{w} becomes {host}. The game loads it{starts}."),
-                    (false, false) => format!("{w} goes in as {t}, started by {starter}."),
-                    (_, true) => format!("{w} comes back as {t}, from dllchain's copy."),
-                });
+                match self.scan.record.mods.iter().find(|m| m.word == self.mods[i].word) {
+                    None => self.plan.summary.push(format!("{w} will be added to your game.")),
+                    Some(m) if m.dll_sha == sha => {
+                        self.plan.summary.push(format!("{w} is put back from dllchain's copy."))
+                    }
+                    // a new version, which plan_install words
+                    Some(_) => {}
+                }
             }
             self.plan.expect_files.push((t.clone(), Some(sha)));
         }
@@ -556,11 +552,10 @@ impl<'a> Work<'a> {
         ours.extend(located.iter().flatten().cloned());
         ours.extend(self.drop.iter().map(|d| d.0.clone()));
         let guests: Vec<usize> = (0..n).filter(|&i| !targets[i].same(&host)).collect();
-        let mut taken_out = Vec::new();
+        // the file list shows the chain file changing; the lines above say what that means for the player
         for r in &ours {
-            if !r.same(&host) && !guests.iter().any(|&g| targets[g].same(r)) && chain.remove(r) {
-                taken_out.push(self.plan.summary.len());
-                self.plan.summary.push(format!("{r} is taken out of {}.", ctx.game.chain_file));
+            if !r.same(&host) && !guests.iter().any(|&g| targets[g].same(r)) {
+                chain.remove(r);
             }
         }
         let mut expect_chain = Vec::new();
@@ -571,14 +566,13 @@ impl<'a> Work<'a> {
             let r = chain.add(&targets[g], ctx.game.host_dll, on);
             if r == AddResult::KeptOff {
                 self.plan.notes.push(format!(
-                    "{} ({}) is switched off in {} ('; ' in front of its line), so it stays off; take the '; ' away to switch it on",
+                    "{} is switched off, so it stays off. To switch it on, take the '; ' away from the start of its line in {}",
                     self.display(word),
-                    targets[g],
                     ctx.game.chain_file
                 ));
             }
             if r == AddResult::SwitchedOn {
-                self.plan.summary.push(format!("{} is switched on again in {}.", targets[g], ctx.game.chain_file));
+                self.plan.summary.push(format!("{} is switched back on.", self.display(word)));
             }
             expect_chain.push((targets[g].clone(), r != AddResult::KeptOff));
         }
@@ -594,14 +588,6 @@ impl<'a> Work<'a> {
             if !chain.names_any_dll(ctx.game.host_dll) && (created || self.scan.chain.is_none()) {
                 if self.scan.chain.is_some() {
                     self.plan.steps.push(Step::Delete(chain_rel.clone()));
-                    // the whole file goes, so its lines need no words of their own
-                    for i in taken_out.iter().rev() {
-                        self.plan.summary.remove(*i);
-                    }
-                    self.plan.summary.push(format!(
-                        "{} is deleted: dllchain made it, and no DLL is left in it.",
-                        ctx.game.chain_file
-                    ));
                 }
                 self.plan.expect_files.push((chain_rel, None));
                 created = false;
@@ -652,44 +638,51 @@ impl<'a> Work<'a> {
             if self.ctx.exists(&RelPath::of(OWN_DIR)) {
                 self.plan.remove_own_dir = true;
                 if !self.plan.steps.is_empty() {
-                    self.plan.summary.push("dllchain's own folder is removed: nothing is left to undo.".into());
+                    self.plan.summary.push("dllchain's own folder is removed too: nothing is left to undo.".into());
                 }
             }
         } else {
             let text = self.plan.record.to_text().into_bytes();
             if self.ctx.read(&rel).as_deref() != Some(text.as_slice()) {
                 if self.plan.steps.is_empty() {
-                    self.plan.summary.push("dllchain's list is brought up to date: another tool moved a DLL.".into());
+                    self.plan.summary.push("dllchain notes that another tool moved a mod.".into());
                 }
                 self.plan.expect_files.push((rel.clone(), Some(sha256_hex(&text))));
                 self.plan.steps.push(Step::Write(rel, text));
             }
         }
-        // renames first, then the files next to the game, then the mods' folders
+        // renames first, then the files next to the game, then the mods' folders, each in name order
         let own = |r: &RelPath| r.first_part().eq_ignore_ascii_case(OWN_DIR);
-        let mut gone: Vec<&RelPath> = Vec::new();
-        let mut lines: Vec<(u8, String)> = Vec::new();
-        for s in &self.plan.steps {
-            let line = match s {
+        let steps = &self.plan.steps;
+        let mut renamed_away: Vec<&RelPath> = Vec::new();
+        let mut lines: Vec<(u8, String, String)> = Vec::new();
+        for (i, s) in steps.iter().enumerate() {
+            let (key, rel, line) = match s {
                 Step::Write(r, _) if !own(r) => {
-                    let there = self.ctx.exists(r) && !gone.iter().any(|g| g.same(r));
-                    (1, format!("{r} ({})", if there { "replaced" } else { "new" }))
+                    let there = self.ctx.exists(r) && !renamed_away.iter().any(|g| g.same(r));
+                    (1, r, format!("{r} ({})", if there { "replaced" } else { "new" }))
                 }
                 Step::Rename(a, b) => {
-                    gone.push(a);
-                    (0, format!("{a} renamed to {b}"))
+                    renamed_away.push(a);
+                    (0, a, format!("{a} renamed to {b}"))
                 }
-                Step::Delete(r) if !own(r) => {
-                    gone.push(r);
-                    (1, format!("{r} (deleted)"))
+                // a file another one is renamed onto right after: the rename says it
+                Step::Delete(r)
+                    if !own(r) && !steps[i + 1..].iter().any(|s| matches!(s, Step::Rename(_, b) if b.same(r))) =>
+                {
+                    (1, r, format!("{r} (deleted)"))
                 }
                 _ => continue,
             };
-            let top = !line.1.split(' ').next().unwrap_or_default().contains('\\');
-            lines.push(if line.0 == 1 && !top { (2, line.1) } else { line });
+            let key = if key == 1 && !rel.is_top_level() { 2 } else { key };
+            lines.push((key, rel.key(), line));
         }
-        lines.sort_by_key(|(k, _)| *k);
-        self.plan.files = lines.into_iter().map(|(_, l)| l).collect();
+        lines.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        self.plan.files = lines.into_iter().map(|(_, _, l)| l).collect();
+        if self.plan.summary.is_empty() && !self.plan.files.is_empty() {
+            let k = self.plan.files.len();
+            self.plan.summary.push(if k == 1 { "Tidies up 1 file.".into() } else { format!("Tidies up {k} files.") });
+        }
         self.plan
     }
 }
@@ -722,13 +715,9 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
         Some(i) => {
             let old = w.mods[i].clone();
             if old.dll_sha == info.sha256 {
-                w.plan.notes.push(format!("{display} with this DLL is already installed; its files are checked again"));
+                w.plan.notes.push(format!("{display} is already installed, so dllchain only checks its files"));
             } else {
-                w.plan.summary.push(format!(
-                    "{display} is updated to the new version (DLL SHA-256 {}, was {}).",
-                    short(&info.sha256),
-                    short(&old.dll_sha)
-                ));
+                w.plan.summary.push(format!("{display} will be updated to the new version."));
                 if let Some(at) = locate(ctx, &scan, &old) {
                     w.drop.push((at, old.dll_sha.clone()));
                 }
@@ -780,9 +769,15 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     // the DLLs first, then the mod's other files
     let file_lines = w.plan.summary.split_off(before);
     w.layout()?;
+    // the mod being installed first, then what that means for the others
+    let added = format!("{display} will be added to your game.");
+    if let Some(i) = w.plan.summary.iter().position(|l| *l == added) {
+        let l = w.plan.summary.remove(i);
+        w.plan.summary.insert(0, l);
+    }
     w.plan.summary.extend(file_lines);
     for i in &src.ignored {
-        w.plan.notes.push(format!("{i} in the zip is outside the mod's folder and is not installed"));
+        w.plan.notes.push(format!("{i} is outside the mod's folder in the zip, so it is not installed"));
     }
     Ok(w.finish())
 }
@@ -833,9 +828,7 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
                 let new = RelPath::parse(&format!("{rel}.new"))?;
                 w.plan.steps.push(Step::Write(new.clone(), bytes.clone()));
                 w.plan.expect_files.push((new.clone(), Some(sha.clone())));
-                w.plan.notes.push(format!(
-                    "{rel} was changed since it was installed, so yours stays; the new version is {new}"
-                ));
+                w.plan.notes.push(format!("You changed {rel}, so yours stays. The new version is saved as {new}"));
                 files.push(p.clone());
                 files.push(FileRec { rel: new, sha, backup: None });
             }
@@ -852,41 +845,42 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
         }
     }
     let new_count = files.len();
-    let mut gone = 0;
+    let mut undone = Undone::default();
     for p in &prev_files {
         if files.iter().any(|f| f.rel.same(&p.rel)) {
             continue;
         }
-        gone += undo_file(w, p, &mut files) as usize;
-    }
-    match gone {
-        0 => {}
-        1 => w.plan.summary.push("1 file of the old version, which the new one does not have, is deleted.".into()),
-        k => {
-            w.plan.summary.push(format!("{k} files of the old version, which the new one does not have, are deleted."))
-        }
+        undone.add(undo_file(w, p, &mut files), p);
     }
     let created: Vec<&RelPath> = files[..new_count.min(files.len())]
         .iter()
-        .filter(|f| !prev_files.iter().any(|p| p.rel.same(&f.rel)))
+        .filter(|f| !prev_files.iter().any(|p| p.rel.same(&f.rel)) && !w.plan.replaces.iter().any(|r| r.same(&f.rel)))
         .map(|f| &f.rel)
         .collect();
     match created.len() {
         0 => {}
-        1 => w.plan.summary.push(format!("1 more file goes into the game folder: {}.", created[0])),
-        k => w.plan.summary.push(format!("{k} more files go into the game folder{}.", most_in(&created))),
+        1 => w.plan.summary.push(format!("Adds 1 more file: {}.", created[0])),
+        k => w.plan.summary.push(format!("Adds {k} more files{}.", most_in(&created))),
     }
-    match w.plan.replaces.len() {
+    let replaced: Vec<&RelPath> = w.plan.replaces.iter().collect();
+    match replaced.len() {
         0 => {}
-        1 => w.plan.summary.push(format!(
-            "{} is replaced: dllchain did not install it, so it keeps the original, and Uninstall puts it back.",
-            w.plan.replaces[0]
-        )),
-        k => w.plan.summary.push(format!(
-            "{k} files dllchain did not install are replaced; dllchain keeps the originals, and Uninstall puts them back: {}.",
-            w.plan.replaces.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")
-        )),
+        1 => {
+            w.plan.summary.push(format!("Replaces {}, which was already there.", replaced[0]));
+            w.plan.summary.push("dllchain keeps the old one, and Uninstall puts it back.".into());
+        }
+        k => {
+            w.plan.summary.push(format!("Replaces {k} files that were already there{}.", most_in(&replaced)));
+            w.plan.summary.push("dllchain keeps the old ones, and Uninstall puts them back.".into());
+        }
     }
+    let deleted: Vec<&RelPath> = undone.deleted.iter().collect();
+    match deleted.len() {
+        0 => {}
+        1 => w.plan.summary.push(format!("Deletes {}, which the new version does not have.", deleted[0])),
+        k => w.plan.summary.push(format!("Deletes {k} files the new version does not have{}.", most_in(&deleted))),
+    }
+    undone.words(w);
     rec.files = files;
     dirs.sort_by_key(|d| d.key());
     dirs.dedup_by(|a, b| a.same(b));
@@ -894,10 +888,59 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
     Ok(())
 }
 
+/// What `undo_file` did with one file.
+enum Undo {
+    Deleted,
+    Restored,
+    /// The player changed it, so it stays; with whether dllchain still has the original.
+    Kept(bool),
+    /// Already gone.
+    Gone,
+}
+
+/// The files a mod takes away, counted, so a mod with hundreds of files still gets a few lines.
+#[derive(Default)]
+struct Undone {
+    deleted: Vec<RelPath>,
+    restored: Vec<RelPath>,
+    kept: Vec<RelPath>,
+    kept_originals: bool,
+}
+
+impl Undone {
+    fn add(&mut self, u: Undo, f: &FileRec) {
+        match u {
+            Undo::Deleted => self.deleted.push(f.rel.clone()),
+            Undo::Restored => self.restored.push(f.rel.clone()),
+            Undo::Kept(original) => {
+                self.kept.push(f.rel.clone());
+                self.kept_originals |= original;
+            }
+            Undo::Gone => {}
+        }
+    }
+
+    /// The lines for the files put back and kept; the caller words the deleted ones.
+    fn words(&self, w: &mut Work) {
+        let restored: Vec<&RelPath> = self.restored.iter().collect();
+        match restored.len() {
+            0 => {}
+            1 => w.plan.summary.push(format!("Puts back {}, which was there before.", restored[0])),
+            k => w.plan.summary.push(format!("Puts back {k} files that were there before{}.", most_in(&restored))),
+        }
+        let originals =
+            if self.kept_originals { ". dllchain keeps the originals in dllchain\\originals\\" } else { "" };
+        match self.kept.len() {
+            0 => {}
+            1 => w.plan.notes.push(format!("You changed {}, so it stays{originals}", self.kept[0])),
+            k => w.plan.notes.push(format!("You changed {k} of these files, so they stay{originals}")),
+        }
+    }
+}
+
 /// Takes one of a mod's files away again: deleted while it is as dllchain left it, or the original put back; a file
-/// the player changed stays (and stays on the list when `keep_changed` is given). True when it is deleted, for the
-/// caller to count.
-fn undo_file(w: &mut Work, f: &FileRec, keep_changed: &mut Vec<FileRec>) -> bool {
+/// the player changed stays (and stays on the list when `keep_changed` is given).
+fn undo_file(w: &mut Work, f: &FileRec, keep_changed: &mut Vec<FileRec>) -> Undo {
     let ctx = w.ctx;
     let now = ctx.sha(&f.rel);
     let original = f.backup.as_ref().and_then(|b| ctx.read(b).map(|bytes| (b.clone(), bytes)));
@@ -906,24 +949,21 @@ fn undo_file(w: &mut Work, f: &FileRec, keep_changed: &mut Vec<FileRec>) -> bool
             w.plan.expect_files.push((f.rel.clone(), Some(sha256_hex(&bytes))));
             w.plan.steps.push(Step::Write(f.rel.clone(), bytes));
             w.plan.steps.push(Step::Delete(b));
-            w.plan.summary.push(format!("Your original {} is put back.", f.rel));
+            Undo::Restored
         }
-        (true, None) => {
-            if now.is_some() {
-                w.plan.steps.push(Step::Delete(f.rel.clone()));
-                w.plan.expect_files.push((f.rel.clone(), None));
-                return true;
-            }
+        (true, None) if now.is_some() => {
+            w.plan.steps.push(Step::Delete(f.rel.clone()));
+            w.plan.expect_files.push((f.rel.clone(), None));
+            Undo::Deleted
         }
+        (true, None) => Undo::Gone,
         (false, original) => {
-            let extra = original.map_or(String::new(), |(b, _)| format!("; the original is kept in {b}"));
-            w.plan.notes.push(format!("{} was changed since dllchain installed it, so it stays{extra}", f.rel));
             if f.backup.is_some() {
                 keep_changed.push(f.clone());
             }
+            Undo::Kept(original.is_some())
         }
     }
-    false
 }
 
 /// The folders files go into, the fullest first: `mods\auto-loot-plus\` (two levels at most), with how many.
@@ -942,11 +982,11 @@ fn places(rels: &[&RelPath]) -> Vec<(String, usize)> {
     out
 }
 
-/// ", most of them in mods\auto-loot-plus\" for a list of files, or nothing when they are spread out.
+/// ", most in mods\auto-loot-plus\" for a list of files, or nothing when they are spread out.
 fn most_in(rels: &[&RelPath]) -> String {
     match places(rels).first() {
         Some((p, n)) if !p.is_empty() && *n == rels.len() => format!(", all in {p}"),
-        Some((p, n)) if !p.is_empty() && *n * 2 > rels.len() => format!(", most of them in {p}"),
+        Some((p, n)) if !p.is_empty() && *n * 2 > rels.len() => format!(", most in {p}"),
         _ => String::new(),
     }
 }
@@ -965,14 +1005,12 @@ pub fn plan_repair(ctx: &Ctx) -> Result<Plan> {
     w.adopt_host(None);
     w.layout()?;
     for m in &w.mods {
-        for f in &m.files {
-            if !ctx.exists(&f.rel) {
-                w.plan.notes.push(format!(
-                    "{} of {} is missing; install the mod again to put it back",
-                    f.rel,
-                    ctx.game.display(&m.word)
-                ));
-            }
+        let missing: Vec<&RelPath> = m.files.iter().map(|f| &f.rel).filter(|r| !ctx.exists(r)).collect();
+        let name = name_of(ctx.game, m);
+        match missing.len() {
+            0 => {}
+            1 => w.plan.notes.push(format!("{} of {name} is missing. Install it again to put it back", missing[0])),
+            k => w.plan.notes.push(format!("{k} files of {name} are missing. Install it again to put them back")),
         }
     }
     Ok(w.finish())
@@ -1001,7 +1039,7 @@ pub fn plan_rename(ctx: &Ctx, word: &str, name: Option<&str>) -> Result<Plan> {
         plan.notes.push(format!("{old} already has that name"));
         return Ok(plan);
     }
-    plan.summary.push(format!("{old} is now called {now} in dllchain's list (no file is renamed)."));
+    plan.summary.push(format!("{old} is shown as {now} from now on. No file is renamed."));
     let rel = RelPath::of(RECORD);
     let text = record.to_text().into_bytes();
     plan.expect_files.push((rel.clone(), Some(sha256_hex(&text))));
@@ -1052,29 +1090,22 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
             w.plan.name = display.clone();
         }
         let at = locate(ctx, &scan, &m);
-        let line = w.plan.summary.len();
         let mut kept = Vec::new();
-        let mut gone = 0;
+        let mut undone = Undone::default();
         for f in m.files.iter().rev() {
-            gone += undo_file(&mut w, f, &mut kept) as usize;
+            undone.add(undo_file(&mut w, f, &mut kept), f);
         }
-        let what = match (&at, gone) {
-            (Some(a), 0) => format!("its {a} is deleted"),
-            (Some(a), 1) => format!("its {a} and 1 more file are deleted"),
-            (Some(a), k) => format!("its {a} and {k} more files are deleted"),
-            (None, 0) => "its DLL is already gone".to_string(),
-            (None, 1) => "1 file of it is deleted".to_string(),
-            (None, k) => format!("{k} files of it are deleted"),
-        };
-        w.plan.summary.insert(line, format!("{display} is uninstalled: {what}."));
+        w.plan.summary.push(format!("{display} will be removed from your game."));
+        let mut deleted: Vec<&RelPath> = at.iter().collect();
+        deleted.extend(&undone.deleted);
+        match deleted.len() {
+            0 => {}
+            1 => w.plan.summary.push(format!("Deletes {}.", deleted[0])),
+            k => w.plan.summary.push(format!("Deletes {k} files{}.", most_in(&deleted))),
+        }
+        undone.words(&mut w);
         if let Some(at) = at {
             w.drop.push((at, m.dll_sha.clone()));
-        }
-        if !kept.is_empty() {
-            w.plan.notes.push(format!(
-                "{display}: {} changed file(s) stay, with their originals in dllchain's folder",
-                kept.len()
-            ));
         }
         let mut dirs = m.dirs.clone();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.as_str().matches('\\').count()));
@@ -1086,7 +1117,7 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
             let bytes = ctx.read(&store_rel(t, r)).filter(|b| sha256_hex(b) == *r);
             match bytes {
                 Some(b) => {
-                    w.plan.summary.push(format!("The {display} that was {} before comes back.", ctx.game.host_dll));
+                    w.plan.summary.push(format!("Your earlier copy of {display} is put back."));
                     w.dlls.insert(t.clone(), b);
                     w.mods.push(ModRec {
                         word: t.clone(),

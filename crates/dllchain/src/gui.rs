@@ -495,8 +495,18 @@ fn act(a: Action) {
         for l in o.apply(&ctx, &plan)? {
             out.push_str(&format!("{l}\n"));
         }
-        let words = words.replacen("What changes in", "What changed in", 1);
-        out.push_str(&format!("{intro}{words}\nDone. Every change is in dllchain\\installer.log in the game folder."));
+        let name = if plan.name.is_empty() { "The mod" } else { plan.name.as_str() };
+        let done = match &a {
+            Action::Install(_) => format!("{name} is installed."),
+            Action::Uninstall(Some(_)) => format!("{name} is uninstalled."),
+            Action::Uninstall(None) => "Every mod dllchain installed is uninstalled.".to_string(),
+            _ => "Your mods are repaired.".to_string(),
+        };
+        out.push_str(&format!("{intro}Done: {done}\n\nFiles that changed:\n"));
+        for f in &plan.files {
+            out.push_str(&format!("{f}\n"));
+        }
+        out.push_str("\nEvery change is in dllchain\\installer.log in the game folder.");
         Ok(out)
     })();
     match result {
@@ -508,47 +518,69 @@ fn act(a: Action) {
     }
 }
 
-/// The file list in the details is cut here; the log has every change.
-const MAX_LISTED: usize = 40;
+/// The question stays short whatever the mod holds: this many files under "Show details", this many notes in the
+/// question itself (the rest under "Show details"). The log has every change.
+const MAX_LISTED: usize = 10;
+const MAX_NOTES: usize = 3;
 
-/// Asks before a change, in plain words: what changes in the game folder, and under "Show details" the mod's SHA-256
-/// and every file. True when the player said yes.
-fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
+/// The question for an action, and the word on its button.
+fn question(a: &Action, plan: &Plan) -> (&'static str, String) {
     let name = if plan.name.is_empty() { None } else { Some(plan.name.as_str()) };
-    let (verb, question) = match (a, name) {
+    match (a, name) {
         (Action::Install(_), Some(n)) => ("Install", format!("Install {n}?")),
         (Action::Install(_), None) => ("Install", "Install this mod?".to_string()),
         (Action::Uninstall(Some(_)), Some(n)) => ("Uninstall", format!("Uninstall {n}?")),
         (Action::Uninstall(_), _) => ("Uninstall", "Uninstall every mod dllchain installed?".to_string()),
-        _ => ("Repair", "Repair the chain?".to_string()),
-    };
-    let mut content = String::from("What changes in your game folder:\n");
+        _ => ("Repair", "Repair your mods?".to_string()),
+    }
+}
+
+/// A note as a sentence.
+fn sentence(n: &str) -> String {
+    if n.ends_with(['.', '?', '!']) { n.to_string() } else { format!("{n}.") }
+}
+
+/// Asks before a change, in plain words, one idea per line; under "Show details" the mod's SHA-256, the first files
+/// that change and how many more. True when the player said yes.
+fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
+    let (verb, question) = question(a, plan);
+    let mut content = String::new();
     for l in &plan.summary {
-        content.push_str(&format!("\u{2022} {l}\n"));
+        content.push_str(&format!("{l}\n"));
     }
     if !plan.notes.is_empty() {
-        content.push_str("\nGood to know:\n");
-        for n in &plan.notes {
-            content.push_str(&format!("\u{2022} {n}\n"));
+        content.push('\n');
+        for n in plan.notes.iter().take(MAX_NOTES) {
+            content.push_str(&format!("{}\n", sentence(n)));
+        }
+        if plan.notes.len() > MAX_NOTES {
+            content.push_str(&format!("{} more notes are under Show details.\n", plan.notes.len() - MAX_NOTES));
         }
     }
     if plan.first_install {
-        content.push_str("\nBefore this first install, dllchain copies your saves, as EMF does.");
+        content.push_str("\nFirst, dllchain makes a copy of your saves.\n");
     }
     if let Action::Install(_) = a {
-        content.push_str("\nYou can undo all of this with Uninstall.");
+        content.push_str("\nYou can undo this with Uninstall.");
     }
     let mut details = String::new();
     if !sha.is_empty() {
         details.push_str(&format!("{sha}\n\n"));
     }
-    details.push_str("Files in the game folder:\n");
+    if plan.notes.len() > MAX_NOTES {
+        details.push_str("More notes:\n");
+        for n in &plan.notes[MAX_NOTES..] {
+            details.push_str(&format!("{}\n", sentence(n)));
+        }
+        details.push('\n');
+    }
+    details.push_str("Files that change:\n");
     for f in plan.files.iter().take(MAX_LISTED) {
         details.push_str(&format!("{f}\n"));
     }
     if plan.files.len() > MAX_LISTED {
         details.push_str(&format!(
-            "and {} more; dllchain\\installer.log lists them all after the change.\n",
+            "and {} more. dllchain\\installer.log lists every one after the change.\n",
             plan.files.len() - MAX_LISTED
         ));
     }

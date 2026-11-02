@@ -27,7 +27,7 @@ Close the game and Steam first; dllchain changes nothing while either runs.
 - Select a mod to see everything dllchain knows about it: when it was installed, from which file and website, its SHA-256 and the files it added.
 
 Every change is shown first, in plain words, and only made after you press Install, Uninstall or Repair.
-**Show details** in that question lists the mod's SHA-256 and every file that changes.
+**Show details** in that question shows the mod's SHA-256 and the first files that change; `dllchain\installer.log` in the game folder lists every one.
 The same actions are on the command line in `dllchain-cli.exe`:
 
 ```

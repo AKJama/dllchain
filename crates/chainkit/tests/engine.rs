@@ -511,9 +511,9 @@ fn the_plan_and_the_details_in_plain_words() {
     assert_eq!(
         p.summary,
         [
-            "XHL Core is renamed to xhl-core.dll and keeps working, started by Auto Loot Plus.",
-            "Auto Loot Plus becomes dinput8.dll. The game loads it, and it starts your other mods.",
-            r"4 more files go into the game folder, most of them in mods\auto-loot-plus\."
+            "Auto Loot Plus will be added to your game.",
+            "XHL Core keeps working.",
+            r"Adds 4 more files, most in mods\auto-loot-plus\."
         ],
         "{:?}",
         p.summary
@@ -536,11 +536,65 @@ fn the_plan_and_the_details_in_plain_words() {
     let p = plan_uninstall(&c, Some("auto-loot-plus")).unwrap();
     assert_eq!(p.name, "Auto Loot Plus");
     assert_eq!(
-        p.summary[0], "Auto Loot Plus is uninstalled: its dinput8.dll and 4 more files are deleted.",
+        p.summary,
+        [
+            "Auto Loot Plus will be removed from your game.",
+            r"Deletes 5 files, most in mods\auto-loot-plus\.",
+            "XHL Core keeps working."
+        ],
         "{:?}",
         p.summary
     );
-    assert!(p.summary.iter().any(|l| l.starts_with("XHL Core becomes dinput8.dll")), "{:?}", p.summary);
     run(&c, Ok(p));
+    clean(&dir);
+}
+
+#[test]
+fn a_mod_with_hundreds_of_files_still_gets_a_few_lines() {
+    let dir = game("many");
+    let c = ctx(&dir);
+    // 20 files the player already has, which the mod replaces
+    for i in 0..20 {
+        let p = dir.join(format!(r"mods\big\old-{i}.txt"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"theirs").unwrap();
+    }
+    let names: Vec<String> = (0..320)
+        .map(|i| if i < 20 { format!(r"mods\big\old-{i}.txt") } else { format!(r"mods\big\f{i}.txt") })
+        .collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"ours".as_slice())).collect();
+    let p = plan_install(&c, &src("big.zip", alp(), &files)).unwrap();
+    assert_eq!(
+        p.summary,
+        [
+            "Auto Loot Plus will be added to your game.",
+            r"Adds 300 more files, all in mods\big\.",
+            r"Replaces 20 files that were already there, all in mods\big\.",
+            "dllchain keeps the old ones, and Uninstall puts them back."
+        ],
+        "{:?}",
+        p.summary
+    );
+    assert_eq!(p.files.len(), 321, "{:?}", p.files);
+    apply(&c, &p).unwrap();
+    // the player changes 3 of them; uninstall still words it in a few lines
+    for i in 20..23 {
+        std::fs::write(dir.join(format!(r"mods\big\f{i}.txt")), b"mine").unwrap();
+    }
+    let p = plan_uninstall(&c, Some("auto-loot-plus")).unwrap();
+    assert_eq!(
+        p.summary,
+        [
+            "Auto Loot Plus will be removed from your game.",
+            "Deletes 298 files, most in mods\\big\\.",
+            r"Puts back 20 files that were there before, all in mods\big\.",
+            "dllchain's own folder is removed too: nothing is left to undo."
+        ],
+        "{:?}",
+        p.summary
+    );
+    assert_eq!(p.notes, ["You changed 3 of these files, so they stay"], "{:?}", p.notes);
+    run(&c, Ok(p));
+    assert_eq!(std::fs::read(dir.join(r"mods\big\old-0.txt")).unwrap(), b"theirs");
     clean(&dir);
 }
