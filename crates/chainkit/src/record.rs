@@ -1,0 +1,279 @@
+//! `dllchain\record.txt`: what dllchain installed and where it left each DLL.
+//!
+//! The record is read as untrusted input, like any other file in the game folder: every path is checked again, a
+//! line that does not parse is skipped and reported, and nothing is deleted or moved on its word alone (the files'
+//! SHA-256 must match too).
+
+use crate::OWN_DIR;
+use crate::hash::is_sha256;
+use crate::paths::{RelPath, is_word};
+
+pub const RECORD: &str = "dllchain\\record.txt";
+const HEADER: &str = "dllchain-record\t1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Installed by dllchain from a zip or DLL the player picked.
+    Installed,
+    /// Another mod's `dinput8.dll` that dllchain found and chained; dllchain did not install it and never deletes it.
+    Adopted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRec {
+    pub rel: RelPath,
+    /// What dllchain wrote.
+    pub sha: String,
+    /// A copy of the file that was there before, put back on uninstall.
+    pub backup: Option<RelPath>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModRec {
+    pub word: String,
+    pub kind: Kind,
+    /// When it came: the host is the newest mod that can host, when the current one cannot.
+    pub order: u32,
+    pub at: String,
+    /// The SHA-256 of the zip or DLL it was installed from ("-" when adopted).
+    pub source_sha: String,
+    /// The zip's or DLL's file name, or how it was found.
+    pub label: String,
+    pub dll_sha: String,
+    /// Where dllchain last saw or put its DLL.
+    pub dll_at: RelPath,
+    /// An earlier copy of the same tool, found as `dinput8.dll` and replaced by this install; uninstall puts it back.
+    pub replaced_dll: Option<String>,
+    pub files: Vec<FileRec>,
+    /// Folders it created, for removing them again when empty.
+    pub dirs: Vec<RelPath>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Record {
+    pub mods: Vec<ModRec>,
+    /// dllchain made `dinput8-chain.ini`; it deletes it again once no DLL is left in it.
+    pub chain_created: bool,
+    /// The chain file's DLL lines as dllchain last left them, to show what others changed since.
+    pub chain: Vec<(RelPath, bool)>,
+}
+
+/// Where dllchain keeps a copy of a mod's DLL, for repairs.
+pub fn store_rel(word: &str, sha: &str) -> RelPath {
+    RelPath::of(&format!("{OWN_DIR}\\mods\\{word}\\{sha}.dll"))
+}
+
+fn clean(s: &str) -> String {
+    s.chars().map(|c| if c == '\t' || c == '\r' || c == '\n' { ' ' } else { c }).collect()
+}
+
+impl Record {
+    pub fn next_order(&self) -> u32 {
+        self.mods.iter().map(|m| m.order).max().map_or(1, |o| o + 1)
+    }
+
+    pub fn find(&self, word: &str) -> Option<&ModRec> {
+        self.mods.iter().find(|m| m.word == word)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mods.is_empty() && !self.chain_created
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut out = vec![HEADER.to_string()];
+        for m in &self.mods {
+            let kind = if m.kind == Kind::Installed { "installed" } else { "adopted" };
+            out.push(format!(
+                "mod\t{}\t{kind}\t{}\t{}\t{}\t{}",
+                m.word,
+                m.order,
+                clean(&m.at),
+                m.source_sha,
+                clean(&m.label)
+            ));
+            out.push(format!("dll\t{}\t{}\t{}", m.word, m.dll_at, m.dll_sha));
+            if let Some(r) = &m.replaced_dll {
+                out.push(format!("replaced-dll\t{}\t{r}", m.word));
+            }
+            for f in &m.files {
+                let b = f.backup.as_ref().map_or("-".to_string(), |b| b.to_string());
+                out.push(format!("file\t{}\t{}\t{}\t{b}", m.word, f.rel, f.sha));
+            }
+            for d in &m.dirs {
+                out.push(format!("dir\t{}\t{d}", m.word));
+            }
+        }
+        for (name, on) in &self.chain {
+            out.push(format!("chain\t{name}\t{}", if *on { "on" } else { "off" }));
+        }
+        if self.chain_created {
+            out.push("chain-created".into());
+        }
+        out.join("\r\n") + "\r\n"
+    }
+
+    /// The record and a note for each line it skipped.
+    pub fn parse(text: &str) -> (Record, Vec<String>) {
+        let mut r = Record::default();
+        let mut warn = Vec::new();
+        let mut lines = text.lines();
+        if lines.next().map(str::trim_end) != Some(HEADER) {
+            warn.push("dllchain's record has an unknown format; it is treated as empty".into());
+            return (r, warn);
+        }
+        for (n, line) in lines.enumerate() {
+            let f: Vec<&str> = line.trim_end_matches('\r').split('\t').collect();
+            if let Err(why) = r.parse_line(&f) {
+                warn.push(format!("record line {} skipped ({why}): {}", n + 2, line.trim()));
+            }
+        }
+        (r, warn)
+    }
+
+    fn parse_line(&mut self, f: &[&str]) -> Result<(), String> {
+        let sha = |s: &str| {
+            if is_sha256(s) { Ok(s.to_string()) } else { Err("not a SHA-256".to_string()) }
+        };
+        let rel = |s: &str| RelPath::parse(s).map_err(|e| e.0);
+        let own = |r: RelPath| {
+            if r.first_part().eq_ignore_ascii_case(OWN_DIR) {
+                Ok(r)
+            } else {
+                Err("a backup outside dllchain's folder".to_string())
+            }
+        };
+        let word = |s: &str| {
+            if is_word(s) { Ok(s.to_string()) } else { Err("not a mod word".to_string()) }
+        };
+        match f {
+            ["mod", w, kind, order, at, source, label] => {
+                let kind = match *kind {
+                    "installed" => Kind::Installed,
+                    "adopted" => Kind::Adopted,
+                    _ => return Err("unknown kind".into()),
+                };
+                let w = word(w)?;
+                if self.find(&w).is_some() {
+                    return Err("the same mod twice".into());
+                }
+                let source = if *source == "-" { "-".into() } else { sha(source)? };
+                self.mods.push(ModRec {
+                    word: w,
+                    kind,
+                    order: order.parse().map_err(|_| "not a number")?,
+                    at: at.to_string(),
+                    source_sha: source,
+                    label: label.to_string(),
+                    dll_sha: String::new(),
+                    dll_at: RelPath::of("dinput8.dll"),
+                    replaced_dll: None,
+                    files: Vec::new(),
+                    dirs: Vec::new(),
+                });
+            }
+            ["dll", w, at, s] => {
+                let (at, s) = (rel(at)?, sha(s)?);
+                let m = self.mod_mut(w)?;
+                m.dll_at = at;
+                m.dll_sha = s;
+            }
+            ["replaced-dll", w, s] => {
+                let s = sha(s)?;
+                self.mod_mut(w)?.replaced_dll = Some(s);
+            }
+            ["file", w, at, s, backup] => {
+                let backup = if *backup == "-" { None } else { Some(own(rel(backup)?)?) };
+                let (at, s) = (rel(at)?, sha(s)?);
+                self.mod_mut(w)?.files.push(FileRec { rel: at, sha: s, backup });
+            }
+            ["dir", w, at] => {
+                let at = rel(at)?;
+                self.mod_mut(w)?.dirs.push(at);
+            }
+            ["chain", name, on] => {
+                let on = match *on {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("not on or off".into()),
+                };
+                self.chain.push((rel(name)?, on));
+            }
+            ["chain-created"] => self.chain_created = true,
+            [""] => {}
+            _ => return Err("unknown line".into()),
+        }
+        Ok(())
+    }
+
+    fn mod_mut(&mut self, w: &str) -> Result<&mut ModRec, String> {
+        self.mods.iter_mut().find(|m| m.word == w).ok_or_else(|| "for a mod not listed above".to_string())
+    }
+
+    /// Drops mods whose `dll` line was missing or unreadable.
+    pub fn drop_incomplete(&mut self, warn: &mut Vec<String>) {
+        self.mods.retain(|m| {
+            let ok = is_sha256(&m.dll_sha);
+            if !ok {
+                warn.push(format!("record: {} has no DLL line; left out", m.word));
+            }
+            ok
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Record {
+        let s = "a".repeat(64);
+        Record {
+            mods: vec![ModRec {
+                word: "auto-loot-plus".into(),
+                kind: Kind::Installed,
+                order: 2,
+                at: "2026-11-03 10:00:00".into(),
+                source_sha: s.clone(),
+                label: "Auto\tLoot.zip".into(),
+                dll_sha: "b".repeat(64),
+                dll_at: RelPath::of("dinput8.dll"),
+                replaced_dll: Some("c".repeat(64)),
+                files: vec![FileRec {
+                    rel: RelPath::of("mods\\alp\\config.txt"),
+                    sha: s,
+                    backup: Some(RelPath::of("dllchain\\backup\\1\\x")),
+                }],
+                dirs: vec![RelPath::of("mods\\alp")],
+            }],
+            chain_created: true,
+            chain: vec![(RelPath::of("enstash.dll"), false)],
+        }
+    }
+
+    #[test]
+    fn round_trip() {
+        let r = sample();
+        let (back, warn) = Record::parse(&r.to_text());
+        assert!(warn.is_empty(), "{warn:?}");
+        let mut want = r.clone();
+        want.mods[0].label = "Auto Loot.zip".into();
+        assert_eq!(back, want);
+    }
+
+    #[test]
+    fn hostile_lines_are_skipped() {
+        let s = "a".repeat(64);
+        let text = format!(
+            "{HEADER}\nmod\tx\tinstalled\t1\tnow\t-\tx.zip\ndll\tx\tx.dll\t{s}\nfile\tx\t..\\..\\Windows\\a.dll\t{s}\t-\n\
+             file\tx\tC:\\a.dll\t{s}\t-\nfile\tx\tok.txt\t{s}\tmods\\elsewhere.bak\nfile\tx\tok.txt\tnot-a-sha\t-\n\
+             dll\tnobody\ty.dll\t{s}\nmod\tBAD WORD\tinstalled\t1\tnow\t-\tl\nrm -rf\n"
+        );
+        let (r, warn) = Record::parse(&text);
+        assert_eq!(r.mods.len(), 1);
+        assert!(r.mods[0].files.is_empty());
+        assert_eq!(warn.len(), 7, "{warn:?}");
+        let (r, warn) = Record::parse("something else");
+        assert!(r.mods.is_empty() && warn.len() == 1);
+    }
+}

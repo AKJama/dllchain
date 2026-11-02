@@ -1,0 +1,49 @@
+name: release
+
+# A tag like v0.1.0 builds both programs from this public source and makes a draft release.
+# The draft is published by hand after a look.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "dllchain-${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force dist/$name | Out-Null
+          Copy-Item target/release/dllchain.exe, target/release/dllchain-cli.exe, README.md, LICENSE, THIRD-PARTY-NOTICES.txt dist/$name
+          Compress-Archive -Path dist/$name/* -DestinationPath dist/$name.zip
+          Copy-Item target/release/dllchain.exe, target/release/dllchain-cli.exe dist
+          Push-Location dist
+          Get-ChildItem "$name.zip", dllchain.exe, dllchain-cli.exe |
+            ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/dllchain.exe
+            dist/dllchain-cli.exe
+      - name: Draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" --draft --title "dllchain ${{ github.ref_name }}" `
+            --notes "Built by GitHub Actions from this tag. Check the SHA-256 in SHA256SUMS.txt, or run: gh attestation verify <file> --repo ${{ github.repository }}" `
+            "dist/dllchain-${{ github.ref_name }}.zip" dist/SHA256SUMS.txt

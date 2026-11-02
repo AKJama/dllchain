@@ -1,0 +1,19 @@
+[package]
+name = "chainkit"
+description = "Puts DLL mods that all want to be dinput8.dll into one chain, and takes them out again"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2.workspace = true
+zip.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+] }

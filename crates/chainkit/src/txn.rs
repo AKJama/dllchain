@@ -1,0 +1,420 @@
+//! A run's changes, undoable as one: before a file changes, a copy of it (or the fact that it was not there) and what
+//! dllchain is about to write are saved in `dllchain\journal.txt`. A failed run is rolled back from it at once; a run
+//! that was cut off (power loss, a crash) is rolled back the next time dllchain starts.
+//!
+//! A file is only put back while it still holds what dllchain wrote (or nothing): a change someone else made in the
+//! meantime is left alone and reported.
+
+use crate::OWN_DIR;
+use crate::hash::{file_sha256, is_sha256, sha256_hex};
+use crate::paths::{RelPath, resolve};
+use crate::{Error, Result, fail};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub const JOURNAL: &str = "dllchain\\journal.txt";
+const HEADER: &str = "dllchain-journal\t1";
+const TMP: &str = ".dllchain-tmp";
+
+#[derive(Clone, Debug)]
+struct Touched {
+    rel: RelPath,
+    /// A copy of what was there and its SHA-256, or `None` when nothing was.
+    before: Option<(RelPath, String)>,
+    /// What dllchain meant to leave there, each time it changed the file (`None`: deleted).
+    intended: Vec<Option<String>>,
+}
+
+pub struct Txn {
+    game: PathBuf,
+    id: String,
+    touched: Vec<Touched>,
+    made_dirs: Vec<RelPath>,
+    removed_dirs: Vec<RelPath>,
+    /// One line per change, for the log.
+    pub log: Vec<String>,
+}
+
+impl Txn {
+    pub fn begin(game: &Path, id: &str) -> Result<Txn> {
+        if resolve(game, &RelPath::of(JOURNAL))?.exists() {
+            fail!("an earlier dllchain run was not finished; it must be undone first");
+        }
+        let t = Txn {
+            game: game.to_path_buf(),
+            id: id.to_string(),
+            touched: Vec::new(),
+            made_dirs: Vec::new(),
+            removed_dirs: Vec::new(),
+            log: Vec::new(),
+        };
+        t.make_dirs(&RelPath::of(&format!("{OWN_DIR}\\backup\\{id}\\x")))?;
+        t.persist()?;
+        Ok(t)
+    }
+
+    pub fn backup_dir(&self) -> RelPath {
+        RelPath::of(&format!("{OWN_DIR}\\backup\\{}", self.id))
+    }
+
+    fn path(&self, rel: &RelPath) -> Result<PathBuf> {
+        resolve(&self.game, rel)
+    }
+
+    fn persist(&self) -> Result<()> {
+        let mut lines = vec![format!("{HEADER}\t{}", self.id)];
+        for t in &self.touched {
+            let b = t.before.as_ref().map_or("-\t-".to_string(), |(b, s)| format!("{b}\t{s}"));
+            lines.push(format!("touch\t{}\t{b}", t.rel));
+            for i in &t.intended {
+                lines.push(format!("intend\t{}\t{}", t.rel, i.as_deref().unwrap_or("-")));
+            }
+        }
+        for d in &self.made_dirs {
+            lines.push(format!("made-dir\t{d}"));
+        }
+        for d in &self.removed_dirs {
+            lines.push(format!("removed-dir\t{d}"));
+        }
+        let bytes = (lines.join("\r\n") + "\r\n").into_bytes();
+        write_atomic(&self.path(&RelPath::of(JOURNAL))?, &bytes)
+    }
+
+    /// Creates the folders above `rel` that are missing, and returns them.
+    fn make_dirs(&self, rel: &RelPath) -> Result<Vec<RelPath>> {
+        let mut made = Vec::new();
+        for d in rel.ancestors() {
+            let p = self.path(&d)?;
+            if !p.exists() {
+                std::fs::create_dir(&p).map_err(|e| Error(format!("could not create the folder {d}: {e}")))?;
+                made.push(d);
+            } else if !p.is_dir() {
+                fail!("{d} is a file, so dllchain cannot make a folder there");
+            }
+        }
+        Ok(made)
+    }
+
+    fn touch(&mut self, rel: &RelPath) -> Result<usize> {
+        if let Some(i) = self.touched.iter().position(|t| t.rel.same(rel)) {
+            return Ok(i);
+        }
+        let p = self.path(rel)?;
+        let before = if p.is_file() {
+            let bytes = std::fs::read(&p).map_err(|e| Error(format!("could not read {rel}: {e}")))?;
+            let b = self.backup_dir().join(rel.as_str())?;
+            let bp = self.path(&b)?;
+            self.make_dirs(&b)?;
+            write_atomic(&bp, &bytes)?;
+            Some((b, sha256_hex(&bytes)))
+        } else if p.exists() {
+            fail!("{rel} is a folder, not a file");
+        } else {
+            None
+        };
+        self.touched.push(Touched { rel: rel.clone(), before, intended: Vec::new() });
+        Ok(self.touched.len() - 1)
+    }
+
+    fn intend(&mut self, i: usize, sha: Option<String>) -> Result<()> {
+        self.touched[i].intended.push(sha);
+        self.persist()
+    }
+
+    fn track_dirs(&mut self, rel: &RelPath) -> Result<()> {
+        let made = self.make_dirs(rel)?;
+        if !made.is_empty() {
+            self.made_dirs.extend(made);
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    pub fn write(&mut self, rel: &RelPath, bytes: &[u8]) -> Result<()> {
+        let i = self.touch(rel)?;
+        let sha = sha256_hex(bytes);
+        self.intend(i, Some(sha.clone()))?;
+        self.track_dirs(rel)?;
+        write_atomic(&self.path(rel)?, bytes)?;
+        self.log.push(format!("wrote {rel} (SHA-256 {sha})"));
+        Ok(())
+    }
+
+    pub fn delete(&mut self, rel: &RelPath) -> Result<()> {
+        let i = self.touch(rel)?;
+        let was = self.touched[i].before.as_ref().map(|b| b.1.clone()).unwrap_or_default();
+        self.intend(i, None)?;
+        let p = self.path(rel)?;
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| Error(format!("could not delete {rel}: {e}")))?;
+        }
+        self.log.push(format!("deleted {rel} (was SHA-256 {was})"));
+        Ok(())
+    }
+
+    pub fn rename(&mut self, from: &RelPath, to: &RelPath) -> Result<()> {
+        let pf = self.path(from)?;
+        let Some(sha) = file_sha256(&pf) else { fail!("{from} is not there to rename") };
+        let a = self.touch(from)?;
+        let b = self.touch(to)?;
+        if self.path(to)?.exists() {
+            fail!("{to} is already there; dllchain does not overwrite it");
+        }
+        self.intend(a, None)?;
+        self.intend(b, Some(sha.clone()))?;
+        self.track_dirs(to)?;
+        std::fs::rename(&pf, self.path(to)?).map_err(|e| Error(format!("could not rename {from} to {to}: {e}")))?;
+        self.log.push(format!("renamed {from} to {to} (SHA-256 {sha})"));
+        Ok(())
+    }
+
+    /// Removes the folder when it is empty; a folder with anything in it stays.
+    pub fn remove_dir_if_empty(&mut self, rel: &RelPath) -> Result<bool> {
+        let p = self.path(rel)?;
+        if !p.is_dir() || std::fs::read_dir(&p)?.next().is_some() {
+            return Ok(false);
+        }
+        self.removed_dirs.push(rel.clone());
+        self.persist()?;
+        std::fs::remove_dir(&p).map_err(|e| Error(format!("could not remove the folder {rel}: {e}")))?;
+        self.log.push(format!("removed the empty folder {rel}"));
+        Ok(true)
+    }
+
+    pub fn commit(self) -> Result<Vec<String>> {
+        // the journal goes first: without it the copies are never needed again
+        std::fs::remove_file(self.path(&RelPath::of(JOURNAL))?)?;
+        self.drop_backups();
+        Ok(self.log)
+    }
+
+    /// Removes this run's copies (and the backup folder when no other run's copies are in it).
+    fn drop_backups(&self) {
+        if let Ok(p) = self.path(&self.backup_dir()) {
+            let _ = std::fs::remove_dir_all(&p);
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::remove_dir(parent); // only when empty
+            }
+        }
+    }
+
+    /// Puts every touched file back as it was. Returns a line for each file it had to leave alone.
+    pub fn rollback(self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for d in self.removed_dirs.iter().rev() {
+            if let Ok(p) = self.path(d) {
+                let _ = std::fs::create_dir_all(p);
+            }
+        }
+        for t in self.touched.iter().rev() {
+            let Ok(p) = self.path(&t.rel) else {
+                notes.push(format!("{}: left as it is (the path is not safe)", t.rel));
+                continue;
+            };
+            let _ = std::fs::remove_file(tmp_path(&p));
+            let now = file_sha256(&p);
+            let before_sha = t.before.as_ref().map(|b| b.1.clone());
+            if now == before_sha {
+                continue;
+            }
+            if !t.intended.contains(&now) {
+                notes.push(format!(
+                    "{}: changed by another program during the run, so dllchain left it as it is",
+                    t.rel
+                ));
+                continue;
+            }
+            let r = match &t.before {
+                None => std::fs::remove_file(&p).map_err(Error::from),
+                Some((b, sha)) => match self.path(b).and_then(|bp| std::fs::read(bp).map_err(Error::from)) {
+                    Ok(bytes) if sha256_hex(&bytes) == *sha => write_atomic(&p, &bytes),
+                    Ok(_) => Err(Error("its backup copy was changed".into())),
+                    Err(e) => Err(e),
+                },
+            };
+            if let Err(e) = r {
+                notes.push(format!("{}: could not be put back ({e})", t.rel));
+            }
+        }
+        for d in self.made_dirs.iter().rev() {
+            if let Ok(p) = self.path(d) {
+                let _ = std::fs::remove_dir(p); // only when empty
+            }
+        }
+        if let Ok(p) = self.path(&RelPath::of(JOURNAL)) {
+            let _ = std::fs::remove_file(p);
+        }
+        // a file that could not be put back keeps its copy
+        if notes.iter().all(|n| !n.contains("could not be put back")) {
+            self.drop_backups();
+        }
+        notes
+    }
+}
+
+/// Rolls back a run that was cut off, from its journal. `None` when there was none.
+pub fn recover(game: &Path) -> Result<Option<Vec<String>>> {
+    let jp = resolve(game, &RelPath::of(JOURNAL))?;
+    let Ok(text) = std::fs::read_to_string(&jp) else {
+        return Ok(None);
+    };
+    let mut lines = text.lines();
+    let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+    let id = match head.as_slice() {
+        ["dllchain-journal", "1", id] if crate::paths::is_word(id) => id.to_string(),
+        _ => {
+            std::fs::remove_file(&jp)?;
+            return Ok(Some(vec![
+                "dllchain's journal of an unfinished run could not be read; it was removed and nothing was undone"
+                    .into(),
+            ]));
+        }
+    };
+    let mut t = Txn {
+        game: game.to_path_buf(),
+        id,
+        touched: Vec::new(),
+        made_dirs: Vec::new(),
+        removed_dirs: Vec::new(),
+        log: Vec::new(),
+    };
+    let backups = t.backup_dir();
+    let mut notes = Vec::new();
+    for line in lines {
+        let f: Vec<&str> = line.split('\t').collect();
+        let ok = match f.as_slice() {
+            ["touch", rel, b, s] => match RelPath::parse(rel) {
+                Ok(rel) => {
+                    let before = if *b == "-" {
+                        Some(None)
+                    } else {
+                        RelPath::parse(b)
+                            .ok()
+                            .filter(|b| b.strip_prefix(&backups).is_some() && is_sha256(s))
+                            .map(|b| Some((b, s.to_string())))
+                    };
+                    before.map(|before| t.touched.push(Touched { rel, before, intended: Vec::new() })).is_some()
+                }
+                Err(_) => false,
+            },
+            ["intend", rel, s] => {
+                let sha = if *s == "-" {
+                    Some(None)
+                } else if is_sha256(s) {
+                    Some(Some(s.to_string()))
+                } else {
+                    None
+                };
+                match (RelPath::parse(rel), sha) {
+                    (Ok(rel), Some(sha)) => {
+                        t.touched.iter_mut().find(|x| x.rel.same(&rel)).map(|x| x.intended.push(sha)).is_some()
+                    }
+                    _ => false,
+                }
+            }
+            ["made-dir", d] => RelPath::parse(d).map(|d| t.made_dirs.push(d)).is_ok(),
+            ["removed-dir", d] => RelPath::parse(d).map(|d| t.removed_dirs.push(d)).is_ok(),
+            [""] => true,
+            _ => false,
+        };
+        if !ok {
+            notes.push(format!("journal line skipped: {line}"));
+        }
+    }
+    let mut out = vec!["An earlier dllchain run was cut off; its changes were undone.".to_string()];
+    out.extend(notes);
+    out.extend(t.rollback());
+    Ok(Some(out))
+}
+
+fn tmp_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(TMP);
+    PathBuf::from(s)
+}
+
+/// Writes through a temporary file and a rename, so a file is never half-written.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = tmp_path(path);
+    let r = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        fail!("could not write {}: {e}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("chainkit-txn-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn rollback_puts_everything_back() {
+        let g = dir("rollback");
+        std::fs::write(g.join("a.txt"), b"old a").unwrap();
+        std::fs::write(g.join("b.dll"), b"bbb").unwrap();
+        let mut t = Txn::begin(&g, "t1").unwrap();
+        t.write(&RelPath::of("a.txt"), b"new a").unwrap();
+        t.write(&RelPath::of("new\\deep\\c.txt"), b"c").unwrap();
+        t.rename(&RelPath::of("b.dll"), &RelPath::of("moved.dll")).unwrap();
+        t.delete(&RelPath::of("a.txt")).unwrap();
+        assert!(!g.join("a.txt").exists());
+        let notes = t.rollback();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(std::fs::read(g.join("a.txt")).unwrap(), b"old a");
+        assert_eq!(std::fs::read(g.join("b.dll")).unwrap(), b"bbb");
+        assert!(!g.join("moved.dll").exists());
+        assert!(!g.join("new").exists());
+        assert!(!g.join(JOURNAL).exists());
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    #[test]
+    fn a_cut_off_run_is_undone_and_others_changes_are_kept() {
+        let g = dir("recover");
+        std::fs::write(g.join("a.txt"), b"old").unwrap();
+        let mut t = Txn::begin(&g, "t2").unwrap();
+        t.write(&RelPath::of("a.txt"), b"mine").unwrap();
+        t.write(&RelPath::of("b.txt"), b"mine too").unwrap();
+        std::mem::forget(t); // as if the process stopped here
+        std::fs::write(g.join("b.txt"), b"someone else").unwrap();
+        let notes = recover(&g).unwrap().unwrap();
+        assert_eq!(std::fs::read(g.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(g.join("b.txt")).unwrap(), b"someone else");
+        assert!(notes.iter().any(|n| n.contains("b.txt") && n.contains("another program")), "{notes:?}");
+        assert_eq!(recover(&g).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&g);
+    }
+
+    #[test]
+    fn a_hostile_journal_cannot_reach_outside() {
+        let g = dir("hostile");
+        let outside = g.join("..").join(format!("chainkit-txn-outside-{}", std::process::id()));
+        std::fs::write(&outside, b"keep me").unwrap();
+        std::fs::create_dir_all(g.join(OWN_DIR)).unwrap();
+        let journal = format!(
+            "{HEADER}\tt3\ntouch\t..\\{name}\t-\t-\nintend\t..\\{name}\t-\ntouch\tx.txt\tC:\\Windows\\win.ini\t{s}\n",
+            name = outside.file_name().unwrap().to_string_lossy(),
+            s = "a".repeat(64)
+        );
+        std::fs::write(g.join(JOURNAL), journal).unwrap();
+        let notes = recover(&g).unwrap().unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep me");
+        assert!(notes.len() >= 3, "{notes:?}");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&g);
+    }
+}
