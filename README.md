@@ -2,6 +2,25 @@
 
 Installs several `dinput8.dll` mods for one game side by side, and takes them out again.
 
+## First time? Step by step
+
+1. Close the game, then close Steam too (Steam > Exit).
+   dllchain changes nothing while either runs.
+2. Download the dllchain zip from the [latest release](https://github.com/AKJama/dllchain/releases/latest) and unzip it into a folder of its own, such as `Documents\dllchain`.
+   Not into the game folder.
+3. Run `dllchain.exe` from that folder.
+   It finds the game through Steam.
+   `dllchain-cli.exe` is the same for the command line; you don't need it.
+4. Click **Install mod...** and pick a mod's zip as you downloaded it (no need to unzip it).
+   dllchain says what it will do; press **Install**.
+5. Do the same for each other `dinput8.dll` mod.
+   A `dinput8.dll` you already put in by hand is kept and joins the chain.
+6. There is no ini to edit: dllchain writes `dinput8-chain.ini` itself.
+7. Start Steam and the game.
+   Each mod's own log says whether it loaded.
+
+Never copy one mod's `dinput8.dll` over another's: the mod that was there is switched off without any error.
+
 Many DLL mods ship as `dinput8.dll`, and a game folder can only hold one file with that name.
 The community answer is a chain: the `dinput8.dll` in the game folder (the host) starts the other mods listed in `dinput8-chain.ini`.
 dllchain sets that chain up for you, using the `dinput8-chain.ini` format other chain loaders already read, so it works alongside them.
