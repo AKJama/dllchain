@@ -124,13 +124,11 @@ fn run(a: &Args) -> Result<Outcome> {
         Cmd::CheckUpdate => unreachable!("handled above"),
     };
     print!("\n{}", describe(&plan));
-    if let Cmd::Uninstall(None) = a.cmd {
-        if !plan.is_empty() {
-            print!("\nThese files are removed:\n{}Undo cannot take this back.\n", common::removed_text(&plan));
-        }
-    }
     if plan.is_empty() {
         return Ok(Outcome::Done);
+    }
+    if let Cmd::Uninstall(None) = a.cmd {
+        print!("\n{}", common::removed_text(&plan, usize::MAX).0);
     }
     if !plan.replaces.is_empty() && !a.allow_replace {
         return Ok(Outcome::Refused("Add --allow-replace to replace those files.".into()));

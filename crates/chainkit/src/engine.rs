@@ -16,7 +16,7 @@ use crate::source::{ModSource, check_target, release_extra};
 use crate::steam::is_game_folder;
 use crate::txn::{Txn, recover};
 use crate::{Error, OWN_DIR, Result, clock, fail};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 pub const LOG: &str = "dllchain\\installer.log";
@@ -124,25 +124,33 @@ impl Plan {
     /// The files the run takes out of the game folder for good (dllchain's own folder aside), by the folder they are
     /// in: `""` for the game folder itself, else `mods\x\`. A file the run puts back afterwards is not one of them.
     pub fn removed_by_folder(&self) -> Vec<(String, Vec<String>)> {
-        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        // keyed on the folder in lower case, so one folder spelt two ways is one
+        let mut out: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
         for (i, s) in self.steps.iter().enumerate() {
             let Step::Delete(r) = s else { continue };
-            if r.first_part().eq_ignore_ascii_case(OWN_DIR) || put_back_after(&self.steps, i, r) {
+            if is_own(r) || put_back_after(&self.steps, i, r) {
                 continue;
             }
             let folder = r.parent().map_or(String::new(), |p| format!("{p}\\"));
-            let name = r.file_name().to_string();
-            match out.iter_mut().find(|(f, _)| f.eq_ignore_ascii_case(&folder)) {
-                Some((_, names)) => names.push(name),
-                None => out.push((folder, vec![name])),
-            }
+            out.entry(folder.to_lowercase()).or_insert_with(|| (folder, Vec::new())).1.push(r.file_name().to_string());
         }
-        out.sort();
-        for (_, names) in &mut out {
-            names.sort_by_key(|n| n.to_lowercase());
-        }
-        out
+        out.into_values()
+            .map(|(folder, mut names)| {
+                names.sort_by_key(|n| n.to_lowercase());
+                (folder, names)
+            })
+            .collect()
     }
+}
+
+/// Whether the file is in dllchain's own folder.
+fn is_own(r: &RelPath) -> bool {
+    r.first_part().eq_ignore_ascii_case(OWN_DIR)
+}
+
+/// Where dllchain keeps its copy of a file of the mod's that it took out or replaced.
+fn backup_of(word: &str, rel: &RelPath) -> Result<RelPath> {
+    RelPath::parse(&format!("{OWN_DIR}\\originals\\{word}\\{rel}"))
 }
 
 /// Whether a step after `steps[i]` renames or writes a file onto `r` again.
@@ -323,13 +331,13 @@ fn package_dir(host: &PackageHost, word: &str) -> RelPath {
 /// The mod's DLL there, under the name it shipped with: `mods\<word>\dinput8.dll`, or `mods\<word>-dll\dinput8.dll`
 /// for a mod whose zip has a script package of its own in `mods\<word>\`.
 fn is_package_dll(game: &Game, host: &PackageHost, word: &str, at: &RelPath) -> bool {
-    [word.to_string(), format!("{word}{NATIVE_SUFFIX}")]
-        .iter()
-        .any(|w| package_dir(host, w).join(game.host_dll).is_ok_and(|d| d.same(at)))
+    [package_dir(host, word), native_dir(host, word)].iter().any(|d| d.join(game.host_dll).is_ok_and(|d| d.same(at)))
 }
 
-/// The end of a DLL's own folder name when the mod's zip already uses `mods\<word>\`.
-const NATIVE_SUFFIX: &str = "-dll";
+/// The DLL's own folder when the mod's zip already uses `mods\<word>\` for a script package: `mods\<word>-dll`.
+fn native_dir(host: &PackageHost, word: &str) -> RelPath {
+    package_dir(host, &format!("{word}-dll"))
+}
 
 /// A package host's declaration that loads the DLL dllchain puts next to it.
 fn declaration(dll: &str) -> Vec<u8> {
@@ -854,7 +862,7 @@ impl<'a> Work<'a> {
             }
         }
         // renames first, then the files next to the game, then the mods' folders, each in name order
-        let own = |r: &RelPath| r.first_part().eq_ignore_ascii_case(OWN_DIR);
+        let own = is_own;
         let steps = &self.plan.steps;
         let mut renamed_away: Vec<&RelPath> = Vec::new();
         let mut lines: Vec<(u8, String, String)> = Vec::new();
@@ -1068,10 +1076,11 @@ fn plan_install_package(
     // layout the mod has.
     let game_layout = shipped_decl.is_none() && !(dll_only && prev.is_some());
     // the zip's own mods\<word>\ (a script package with mod.json) is not the DLL's folder
-    let dir = if game_layout && src.files.iter().any(|(r, _)| r.strip_prefix(&package_dir(ph, word)).is_some()) {
-        package_dir(ph, &format!("{word}{NATIVE_SUFFIX}"))
+    let own_dir = package_dir(ph, word);
+    let dir = if game_layout && src.files.iter().any(|(r, _)| r.strip_prefix(&own_dir).is_some()) {
+        native_dir(ph, word)
     } else {
-        prev.and_then(|i| w.packages[i].dll_at.parent()).unwrap_or_else(|| package_dir(ph, word))
+        prev.and_then(|i| w.packages[i].dll_at.parent()).unwrap_or(own_dir)
     };
     let dll_rel = dir.join(ctx.game.host_dll)?;
     // a loader that stops the game at a folder in mods\ without mod.json (EML), other than the package host's own
@@ -1108,10 +1117,9 @@ fn plan_install_package(
                     // dinput8.dll is the host's)
                     let rel =
                         if at.same(&ctx.host()) { RelPath::parse(&format!("{}.dll", old.word))? } else { at.clone() };
-                    let Some(bytes) = ctx.read_checked(&at, &old.dll_sha) else {
-                        fail!("{at} changed while dllchain was reading it, so nothing was changed. Try again.");
-                    };
-                    let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", old.word))?;
+                    // its bytes, checked against its SHA-256 when dllchain read the folder
+                    let Some(bytes) = w.dlls.get(&old.word).cloned() else { fail!("could not read {at}") };
+                    let backup = backup_of(&old.word, &rel)?;
                     w.plan.steps.push(Step::Write(backup.clone(), bytes));
                     w.plan.expect_files.push((backup.clone(), Some(old.dll_sha.clone())));
                     w.plan.summary.push(format!(
@@ -1213,8 +1221,7 @@ fn plan_install_package(
             }
         }
     }
-    let leftovers_in = if game_layout { None } else { Some(&dir) };
-    retire(&mut w, &mut rec, leftovers_in, &files, Some((&dir.join(ph.off_switch)?, &host)))?;
+    retire(&mut w, &mut rec, (!game_layout).then_some(&dir), &files, Some((&dir.join(ph.off_switch)?, &host)))?;
     let gone = if chained.is_some() { "it had next to the game" } else { NOT_IN_NEW };
     plan_files(&mut w, &mut rec, &files, &src.label, dll_only, &|r| r.strip_prefix(&dir).is_some(), gone)?;
     w.packages.push(rec);
@@ -1292,7 +1299,7 @@ fn retire(
             continue;
         }
         let Some(bytes) = ctx.read(&rel) else { continue };
-        let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", rec.word))?;
+        let backup = backup_of(&rec.word, &rel)?;
         if ctx.exists(&backup) {
             w.plan.notes.push(format!("{rel} stays: dllchain already keeps another copy of it in {backup}"));
             continue;
@@ -1374,7 +1381,7 @@ fn plan_files(
                 files.push(FileRec { rel: new, sha, backup: None });
             }
             (Some(n), None) => {
-                let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", rec.word))?;
+                let backup = backup_of(&rec.word, rel)?;
                 let Some(old) = ctx.read(rel) else { fail!("could not read {rel}") };
                 debug_assert_eq!(sha256_hex(&old), n);
                 if earlier(rel) {
@@ -1704,7 +1711,7 @@ pub fn plan_undo(ctx: &Ctx) -> Result<Plan> {
                 deleted += 1;
             }
         }
-        if !c.rel.first_part().eq_ignore_ascii_case(OWN_DIR) {
+        if !is_own(&c.rel) {
             let how = if c.before.is_some() { "put back" } else { "deleted" };
             plan.files.push(format!("{} ({how})", c.rel));
         }

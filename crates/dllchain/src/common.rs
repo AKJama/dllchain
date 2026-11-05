@@ -112,19 +112,38 @@ pub fn describe(plan: &Plan) -> String {
     s
 }
 
-/// Every file a run takes out, under the folder it is in, for the question before uninstalling everything.
-pub fn removed_text(plan: &Plan) -> String {
-    let mut s = String::new();
-    for (folder, names) in plan.removed_by_folder() {
-        match folder.as_str() {
-            "" => s.push_str("From the game folder:\n"),
-            f => s.push_str(&format!("From {f}:\n")),
-        }
+/// The question before uninstalling everything: every file the run takes out, under the folder it is in, and that
+/// Undo cannot take it back. Past `max` files the list stops, and the rest comes second (its folder named again), for
+/// Show details. Both are empty when the run takes nothing out.
+pub fn removed_text(plan: &Plan, max: usize) -> (String, String) {
+    split_removed(plan.removed_by_folder(), max)
+}
+
+fn split_removed(by_folder: Vec<(String, Vec<String>)>, max: usize) -> (String, String) {
+    let mut out = [String::new(), String::new()];
+    let mut count = 0;
+    for (folder, names) in by_folder {
+        let head = match folder.as_str() {
+            "" => "From the game folder:\n".to_string(),
+            f => format!("From {f}:\n"),
+        };
+        // each part names the folder before its first file there
+        let mut headed = [false, false];
         for n in names {
-            s.push_str(&format!("    {n}\n"));
+            let k = usize::from(count >= max);
+            if !headed[k] {
+                out[k].push_str(&head);
+                headed[k] = true;
+            }
+            out[k].push_str(&format!("    {n}\n"));
+            count += 1;
         }
     }
-    s
+    let [mut shown, rest] = out;
+    if !shown.is_empty() {
+        shown = format!("These files are removed:\n{shown}Undo cannot take this back.\n");
+    }
+    (shown, rest)
 }
 
 /// A mod's details as aligned lines: the labels in one column, the values in the next. With `tab`, a tab goes
@@ -159,6 +178,25 @@ fn without_verbatim(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_uninstall_list_stops_and_the_rest_names_its_folder_again() {
+        let list = || {
+            vec![
+                (String::new(), vec!["dinput8.dll".to_string(), "enstash.dll".to_string()]),
+                (r"mods\alp\".to_string(), vec!["a.lua".to_string(), "b.lua".to_string()]),
+            ]
+        };
+        let (shown, rest) = split_removed(list(), 3);
+        assert_eq!(
+            shown,
+            "These files are removed:\nFrom the game folder:\n    dinput8.dll\n    enstash.dll\nFrom mods\\alp\\:\n    a.lua\nUndo cannot take this back.\n"
+        );
+        assert_eq!(rest, "From mods\\alp\\:\n    b.lua\n");
+        let (shown, rest) = split_removed(list(), usize::MAX);
+        assert!(shown.contains("    b.lua\n") && rest.is_empty(), "{shown}");
+        assert_eq!(split_removed(Vec::new(), 3), (String::new(), String::new()));
+    }
 
     #[test]
     fn folders_are_shown_as_explorer_shows_them() {

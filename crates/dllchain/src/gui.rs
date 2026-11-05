@@ -612,31 +612,23 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
     }
     // every file, and where it is, as this one cannot be undone; a long list goes on under Show details, so the
     // box stays on the screen
-    let removed = match a {
-        Action::Uninstall(None) => common::removed_text(plan),
-        _ => String::new(),
+    let (shown, rest) = match a {
+        Action::Uninstall(None) => common::removed_text(plan, MAX_REMOVED),
+        _ => Default::default(),
     };
-    let removed: Vec<&str> = removed.lines().collect();
-    let (shown, rest) = removed.split_at(removed.len().min(MAX_REMOVED));
     if !shown.is_empty() {
-        content.push_str(&format!("\nThese files are removed:\n{}\n", plain(&shown.join("\n"))));
+        content.push_str(&format!("\n{}", plain(&shown)));
         if !rest.is_empty() {
-            content.push_str("The rest are under Show details.\n");
+            content.push_str("The rest of the list is under Show details.\n");
         }
-        content.push_str("\nUndo cannot take this back. Cancel changes nothing.");
+        content.push_str("Cancel changes nothing.");
     }
     let mut details = String::new();
     if !sha.is_empty() {
         details.push_str(&format!("{sha}\n\n"));
     }
     if !rest.is_empty() {
-        // the folder the list stopped in comes again
-        let folder = shown.iter().rev().find(|l| !l.starts_with(' ')).filter(|_| rest[0].starts_with(' '));
-        details.push_str("Also removed:\n");
-        for l in folder.into_iter().chain(rest) {
-            details.push_str(&format!("{l}\n"));
-        }
-        details.push('\n');
+        details.push_str(&format!("Also removed:\n{rest}\n"));
     }
     if plan.notes.len() > MAX_NOTES {
         details.push_str("More notes:\n");
