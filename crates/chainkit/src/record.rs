@@ -48,7 +48,12 @@ pub struct ModRec {
     pub dll_at: RelPath,
     /// An earlier copy of the same tool, found as `dinput8.dll` and replaced by this install; uninstall puts it back.
     pub replaced_dll: Option<String>,
+    /// Its version: from the DLL's version information, else from the name of the zip it came in.
+    pub version: Option<String>,
     pub files: Vec<FileRec>,
+    /// Files an older version or a hand install left in the mod's folder that dllchain took out (`sha` is what was
+    /// there, `backup` its copy); uninstall puts them back.
+    pub retired: Vec<FileRec>,
     /// Folders it created, for removing them again when empty.
     pub dirs: Vec<RelPath>,
 }
@@ -134,9 +139,14 @@ impl Record {
             if let Some(r) = &m.replaced_dll {
                 out.push(format!("replaced-dll\t{}\t{r}", m.word));
             }
-            for f in &m.files {
-                let b = f.backup.as_ref().map_or("-".to_string(), |b| b.to_string());
-                out.push(format!("file\t{}\t{}\t{}\t{b}", m.word, f.rel, f.sha));
+            if let Some(v) = &m.version {
+                out.push(format!("version\t{}\t{}", m.word, clean(v)));
+            }
+            for (kind, list) in [("file", &m.files), ("retired", &m.retired)] {
+                for f in list {
+                    let b = f.backup.as_ref().map_or("-".to_string(), |b| b.to_string());
+                    out.push(format!("{kind}\t{}\t{}\t{}\t{b}", m.word, f.rel, f.sha));
+                }
             }
             for d in &m.dirs {
                 out.push(format!("dir\t{}\t{d}", m.word));
@@ -208,7 +218,9 @@ impl Record {
                     dll_sha: String::new(),
                     dll_at: RelPath::of("dinput8.dll"),
                     replaced_dll: None,
+                    version: None,
                     files: Vec::new(),
+                    retired: Vec::new(),
                     dirs: Vec::new(),
                 });
             }
@@ -234,6 +246,15 @@ impl Record {
                 let backup = if *backup == "-" { None } else { Some(own(rel(backup)?)?) };
                 let (at, s) = (rel(at)?, sha(s)?);
                 self.mod_mut(w)?.files.push(FileRec { rel: at, sha: s, backup });
+            }
+            ["version", w, v] => {
+                let v = clean_name(v).ok_or("not a version")?;
+                self.mod_mut(w)?.version = Some(v);
+            }
+            ["retired", w, at, s, backup] => {
+                let backup = own(rel(backup)?)?;
+                let (at, s) = (rel(at)?, sha(s)?);
+                self.mod_mut(w)?.retired.push(FileRec { rel: at, sha: s, backup: Some(backup) });
             }
             ["dir", w, at] => {
                 let at = rel(at)?;
@@ -289,10 +310,16 @@ mod tests {
                 dll_sha: "b".repeat(64),
                 dll_at: RelPath::of("dinput8.dll"),
                 replaced_dll: Some("c".repeat(64)),
+                version: Some("1.1.8".into()),
                 files: vec![FileRec {
                     rel: RelPath::of("mods\\alp\\config.txt"),
                     sha: s,
                     backup: Some(RelPath::of("dllchain\\backup\\1\\x")),
+                }],
+                retired: vec![FileRec {
+                    rel: RelPath::of("mods\\alp\\old.txt"),
+                    sha: "d".repeat(64),
+                    backup: Some(RelPath::of("dllchain\\originals\\alp\\mods\\alp\\old.txt")),
                 }],
                 dirs: vec![RelPath::of("mods\\alp")],
             }],

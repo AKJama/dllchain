@@ -6,7 +6,9 @@
 mod common;
 mod update;
 
-use chainkit::engine::{Ctx, Plan, Row, plan_install, plan_rename, plan_repair, plan_uninstall, status};
+use chainkit::engine::{
+    Ctx, Load, Plan, Row, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status,
+};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source, steam};
 use common::{GAME, Opts, describe, details_text, shown};
@@ -58,6 +60,7 @@ const ID_OPEN: i32 = 108;
 const ID_LOG: i32 = 109;
 const ID_RENAME: i32 = 110;
 const ID_PAGE: i32 = 111;
+const ID_UNDO: i32 = 112;
 const ID_CHECK_UPDATE: i32 = 201;
 const ID_ABOUT: i32 = 202;
 const WM_START: u32 = WM_APP + 1;
@@ -74,7 +77,7 @@ struct Ctl {
     change: HWND,
     list_label: HWND,
     list: HWND,
-    buttons: [HWND; 7],
+    buttons: [HWND; 8],
     log: HWND,
     font: HFONT,
 }
@@ -193,6 +196,7 @@ fn create_controls(main: HWND) {
             button("&Uninstall", ID_UNINSTALL),
             button("Uninstall &all", ID_UNINSTALL_ALL),
             button("&Repair", ID_REPAIR),
+            button("Un&do", ID_UNDO),
             button("&Open game folder", ID_OPEN),
         ],
         log: child(
@@ -354,6 +358,7 @@ fn refresh(msg: &str) {
         text.push_str("\n\n");
     }
     let mut can_repair = false;
+    let mut can_undo = false;
     let rows = match o.game_dir().and_then(|d| Ctx::new(&d, GAME)) {
         Err(e) => {
             set_text(c.game, "");
@@ -379,11 +384,22 @@ fn refresh(msg: &str) {
                     for n in &st.notes {
                         text.push_str(&format!("Note: {n}\n"));
                     }
+                    for r in &st.rows {
+                        if let Some((Load::NotLoaded, l)) = &r.load {
+                            text.push_str(&format!("{} {l}.\n", r.name));
+                        }
+                    }
                     let listed = st.rows.iter().any(|r| r.word.is_some());
                     let by_hand = st.rows.iter().find(|r| r.word.is_none() && r.file.as_str() == GAME.host_dll);
                     if let Some(r) = by_hand.filter(|_| !listed) {
+                        let then = match &st.package_host {
+                            Some((_, dir)) => {
+                                format!("a mod you install goes into {dir}\\<mod>\\, where {} loads it", r.name)
+                            }
+                            None => "when you install another mod, it joins the chain".to_string(),
+                        };
                         text.push_str(&format!(
-                            "{} is {}, put there by hand or by another tool. dllchain leaves it as it is; when you install another mod, it joins the chain.\n",
+                            "{} is {}, put there by hand or by another tool. dllchain leaves it as it is; {then}.\n",
                             GAME.host_dll, r.name
                         ));
                     } else if st.repair.is_empty() && !st.rows.is_empty() {
@@ -399,6 +415,10 @@ fn refresh(msg: &str) {
                         }
                     }
                     can_repair = !st.repair.is_empty();
+                    if let Some((what, when)) = &st.undo {
+                        text.push_str(&format!("\nLast change: {what} ({when}). Undo takes it back.\n"));
+                        can_undo = true;
+                    }
                     st.rows
                 }
             }
@@ -410,7 +430,15 @@ fn refresh(msg: &str) {
         for (i, r) in rows.iter().enumerate() {
             let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());
             let at = chainkit::clock::readable(&r.at).split(',').next().unwrap_or_default().to_string();
-            let cells = [r.name.clone(), r.file.to_string(), r.role.clone(), at, sha, r.source.clone()];
+            let name = match &r.version {
+                Some(v) => format!("{} {v}", r.name),
+                None => r.name.clone(),
+            };
+            let role = match &r.load {
+                Some((Load::NotLoaded, _)) => format!("{}; did not load", r.role),
+                _ => r.role.clone(),
+            };
+            let cells = [name, r.file.to_string(), role, at, sha, r.source.clone()];
             for (k, cell) in cells.iter().enumerate() {
                 let mut text = wide(cell);
                 let item = LVITEMW {
@@ -430,7 +458,7 @@ fn refresh(msg: &str) {
     let has_listed = rows.iter().any(|r| r.word.is_some());
     let has_game = o.game_dir().is_ok();
     // Mod page follows the selection, which a refresh clears
-    let on = [has_game, has_listed, false, has_installed, has_installed, can_repair, has_game];
+    let on = [has_game, has_listed, false, has_installed, has_installed, can_repair, can_undo, has_game];
     for (b, on) in c.buttons.iter().zip(on) {
         // SAFETY: our button.
         unsafe { EnableWindow(*b, on as i32) };
@@ -450,6 +478,7 @@ enum Action {
     Uninstall(Option<String>),
     Rename(String, String),
     Repair,
+    Undo,
 }
 
 /// Plans the action, asks, and makes the changes. Never holds a borrow while a dialog is open (dialogs run messages).
@@ -478,6 +507,7 @@ fn act(a: Action) {
             }
             Action::Uninstall(w) => (plan_uninstall(&ctx, w.as_deref())?, String::new(), String::new()),
             Action::Repair => (plan_repair(&ctx)?, String::new(), String::new()),
+            Action::Undo => (plan_undo(&ctx)?, String::new(), String::new()),
             Action::Rename(w, n) => (plan_rename(&ctx, w, Some(n))?, String::new(), String::new()),
         };
         let words = describe(&plan);
@@ -501,6 +531,7 @@ fn act(a: Action) {
             Action::Install(_) => format!("{name} is installed."),
             Action::Uninstall(Some(_)) => format!("{name} is uninstalled."),
             Action::Uninstall(None) => "Every mod dllchain installed is uninstalled.".to_string(),
+            Action::Undo => "The last change is taken back. Undo again to make it again.".to_string(),
             _ => "Your mods are repaired.".to_string(),
         };
         out.push_str(&format!("{intro}Done: {done}\n"));
@@ -536,6 +567,7 @@ fn question(a: &Action, plan: &Plan) -> (&'static str, String) {
         (Action::Install(_), None) => ("Install", "Install this mod?".to_string()),
         (Action::Uninstall(Some(_)), Some(n)) => ("Uninstall", format!("Uninstall {n}?")),
         (Action::Uninstall(_), _) => ("Uninstall", "Uninstall every mod dllchain installed?".to_string()),
+        (Action::Undo, _) => ("Undo", "Take back the last change?".to_string()),
         _ => ("Repair", "Repair your mods?".to_string()),
     }
 }
@@ -572,7 +604,7 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
         content.push_str("\nFirst, dllchain makes a copy of your saves.\n");
     }
     if let Action::Install(_) = a {
-        content.push_str("\nYou can undo this with Uninstall.");
+        content.push_str("\nYou can take this back with Undo, or later with Uninstall.");
     }
     let mut details = String::new();
     if !sha.is_empty() {
@@ -756,6 +788,7 @@ fn on_command(id: i32, code: u32) {
         (ID_UNINSTALL, BN_CLICKED) => uninstall_selected(),
         (ID_UNINSTALL_ALL, BN_CLICKED) => act(Action::Uninstall(None)),
         (ID_REPAIR, BN_CLICKED) => act(Action::Repair),
+        (ID_UNDO, BN_CLICKED) => act(Action::Undo),
         (ID_OPEN, BN_CLICKED) => {
             if let Ok(dir) = opts().game_dir() {
                 let (verb, path) = (wide("open"), wide(&dir.display().to_string()));

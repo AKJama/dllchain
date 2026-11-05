@@ -10,6 +10,45 @@ pub struct Tool {
     /// The name players see.
     pub name: &'static str,
     pub texts: &'static [&'static str],
+    /// Its log, which says whether it loaded; `None` when dllchain does not know it.
+    pub log: Option<LoadLog>,
+    /// Files an older version left that a newer one replaced: dllchain takes them out (with a copy) on install.
+    pub leftovers: &'static [Leftover],
+}
+
+impl Tool {
+    /// A tool dllchain knows only by name.
+    pub const fn named(word: &'static str, name: &'static str, texts: &'static [&'static str]) -> Tool {
+        Tool { word, name, texts, log: None, leftovers: &[] }
+    }
+}
+
+/// How a mod's own log, next to its DLL, says it loaded: its first line (after the time) is `<first><version>`, and a
+/// later line has `ok`, or `off` when the player switched the mod's main part off.
+#[derive(Debug)]
+pub struct LoadLog {
+    pub file: &'static str,
+    pub first: &'static str,
+    pub ok: &'static str,
+    pub off: &'static str,
+}
+
+/// `old`, next to the mod's DLL, is what an older version had instead of `new`.
+#[derive(Debug)]
+pub struct Leftover {
+    pub old: &'static str,
+    pub new: &'static str,
+}
+
+/// A loader that refuses DLLs next to the game and runs each DLL mod from a folder of its own, `<dir>\<mod>\`, when
+/// the mod declares itself there with `declaration`. With `off_switch` in that folder too, the loader takes it for one
+/// of its script packages, which stays off until the player enables it.
+#[derive(Debug)]
+pub struct PackageHost {
+    pub word: &'static str,
+    pub dir: &'static str,
+    pub declaration: &'static str,
+    pub off_switch: &'static str,
 }
 
 /// Something a mod needs that dllchain does not install. dllchain only says so; it never blocks or downloads.
@@ -74,6 +113,10 @@ pub struct Game {
     pub saved_games_dir: &'static str,
     /// What mods can need besides dllchain; checked on install and shown with the mod.
     pub requirements: &'static [Requirement],
+    /// Loaders that run DLL mods from folders of their own instead of a chain.
+    pub package_hosts: &'static [PackageHost],
+    /// The game's own log in its folder, written at every start.
+    pub game_log: &'static str,
 }
 
 pub static ENSHROUDED: Game = Game {
@@ -87,14 +130,28 @@ pub static ENSHROUDED: Game = Game {
     // The lines after auto-loot-plus are EMF's known_tools.txt (MIT, Copyright (c) 2026 EMF contributors; see
     // THIRD-PARTY-NOTICES.txt), so both tools give a renamed DLL the same name.
     tools: &[
-        Tool { word: "enstash", name: "enstash", texts: &["enstash Quick Stack"] },
-        Tool { word: "auto-loot-plus", name: "Auto Loot Plus", texts: &["auto-loot-plus"] },
-        Tool { word: "shroudforge", name: "ShroudForge", texts: &["shroudforge"] },
-        Tool { word: "eml", name: "EML (Enshrouded Mod Loader)", texts: &["EML_LOG_FILE_PATH"] },
-        Tool { word: "modloader-proxy", name: "ModLoader Proxy", texts: &["modloader-proxy.dll", "chainloader.ini"] },
-        Tool { word: "shroudtopia", name: "Shroudtopia (or its Shroudweave fork)", texts: &["shroudtopia"] },
-        Tool { word: "greeneye", name: "Greeneye Loader", texts: &["greeneye"] },
-        Tool { word: "aldrich-modmenu", name: "Aldrich Mod Menu", texts: &["aldrich"] },
+        // enstash's first log line is `enstash Quick Stack placeholders <MOD_VERSION>`, and a later one says
+        // `placeholders ON` once Quick Stack is hooked (mod/quickstack/enstash_quickstack.c in AKJama/enshrouded-chests).
+        // From 0.12 its item data is enstash-data.dat; it still reads an old enstash-data.txt, which would be stale.
+        Tool {
+            word: "enstash",
+            name: "enstash",
+            texts: &["enstash Quick Stack"],
+            log: Some(LoadLog {
+                file: "enstash-quickstack.log",
+                first: "enstash Quick Stack placeholders ",
+                ok: "placeholders ON",
+                off: "placeholders OFF",
+            }),
+            leftovers: &[Leftover { old: "enstash-data.txt", new: "enstash-data.dat" }],
+        },
+        Tool::named("auto-loot-plus", "Auto Loot Plus", &["auto-loot-plus"]),
+        Tool::named("shroudforge", "ShroudForge", &["shroudforge"]),
+        Tool::named("eml", "EML (Enshrouded Mod Loader)", &["EML_LOG_FILE_PATH"]),
+        Tool::named("modloader-proxy", "ModLoader Proxy", &["modloader-proxy.dll", "chainloader.ini"]),
+        Tool::named("shroudtopia", "Shroudtopia (or its Shroudweave fork)", &["shroudtopia"]),
+        Tool::named("greeneye", "Greeneye Loader", &["greeneye"]),
+        Tool::named("aldrich-modmenu", "Aldrich Mod Menu", &["aldrich"]),
     ],
     proxy_names: &[
         "dinput8",
@@ -124,11 +181,25 @@ pub static ENSHROUDED: Game = Game {
         file: "mod.json",
         texts: &["EML_LOG_FILE_PATH"],
     }],
+    // ShroudForge 1.7.8's DLL Manager guide (built into shroudforge.exe): a DLL loads only from a folder directly under
+    // mods\, declared by its native-plugin.ini (`[Plugin]`, `Enabled=1`, `Dll=<file>`); DLLs next to the game are
+    // refused. With mod.json there the folder is one of its packages, off until enabled (enstash's rig, S8, S8d, S8e).
+    package_hosts: &[PackageHost {
+        word: "shroudforge",
+        dir: "mods",
+        declaration: "native-plugin.ini",
+        off_switch: "mod.json",
+    }],
+    game_log: "enshrouded.log",
 };
 
 impl Game {
     pub fn tool(&self, word: &str) -> Option<&'static Tool> {
         self.tools.iter().find(|t| t.word == word)
+    }
+
+    pub fn package_host(&self, word: &str) -> Option<&'static PackageHost> {
+        self.package_hosts.iter().find(|p| p.word == word)
     }
 
     /// The name players see for a word: the tool's name, or the word itself.

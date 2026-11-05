@@ -8,7 +8,7 @@
 
 use crate::chainini::{AddResult, ChainFile, Parsed};
 use crate::dllinfo::{DllInfo, WordFrom, contains_text, inspect};
-use crate::game::{Game, Requirement};
+use crate::game::{Game, PackageHost, Requirement};
 use crate::hash::{sha256_hex, short};
 use crate::paths::{RelPath, is_word, resolve};
 use crate::record::{FileRec, Kind, ModRec, RECORD, Record, clean_name, store_rel};
@@ -52,6 +52,10 @@ impl Ctx {
 
     fn exists(&self, rel: &RelPath) -> bool {
         resolve(&self.dir, rel).map(|p| p.exists()).unwrap_or(true)
+    }
+
+    fn modified(&self, rel: &RelPath) -> Option<std::time::SystemTime> {
+        resolve(&self.dir, rel).ok().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok())
     }
 
     fn host(&self) -> RelPath {
@@ -207,7 +211,7 @@ fn scan(ctx: &Ctx) -> Result<Scan> {
 /// EMF and not another mod on the list, and if it says which mod it is, that is this one. A missing file, or anything
 /// else in its place, is still repaired. (`dinput8.dll` itself is [`Work::adopt_host`]'s.)
 fn rebuilt(ctx: &Ctx, scan: &Scan, m: &ModRec) -> Option<(String, Vec<u8>, DllInfo)> {
-    if m.dll_at.same(&ctx.host()) || locate(ctx, scan, m).is_some() {
+    if is_package(m) || m.dll_at.same(&ctx.host()) || locate(ctx, scan, m).is_some() {
         return None;
     }
     let bytes = ctx.read(&m.dll_at)?;
@@ -259,20 +263,46 @@ fn keep_safe(record: &mut Record, game: &Game, notes: &mut Vec<String>) {
             && at.extension() == ".dll"
             && !game.protected_names.contains(&name.as_str())
             && game.proxy_names.iter().all(|p| *p == host_stem || format!("{p}.dll") != name);
-        if !dll_ok {
+        if !dll_ok && !game.package_hosts.iter().any(|h| at.same(&package_dll(game, h, &m.word))) {
             notes.push(format!("record: {} would have its DLL at {at}, which dllchain never uses; left out", m.word));
             return false;
         }
-        m.files.retain(|f| {
-            let ok =
-                check_target(&f.rel, game).is_ok() && f.backup.as_ref().is_none_or(|b| b.key().starts_with(&originals));
-            if !ok {
-                notes.push(format!("record: {}'s file {} is not one dllchain installs; left out", m.word, f.rel));
-            }
-            ok
-        });
+        let word = m.word.clone();
+        for (what, list) in [("file", &mut m.files), ("old file", &mut m.retired)] {
+            list.retain(|f| {
+                let ok = check_target(&f.rel, game).is_ok()
+                    && f.backup.as_ref().is_none_or(|b| b.key().starts_with(&originals));
+                if !ok {
+                    notes.push(format!("record: {word}'s {what} {} is not one dllchain installs; left out", f.rel));
+                }
+                ok
+            });
+        }
         true
     });
+}
+
+/// The folder a package host runs a mod from: `mods\<word>`.
+fn package_dir(host: &PackageHost, word: &str) -> RelPath {
+    RelPath::of(&format!("{}\\{word}", host.dir))
+}
+
+/// The mod's DLL there, under the name it shipped with: `mods\<word>\dinput8.dll`.
+fn package_dll(game: &Game, host: &PackageHost, word: &str) -> RelPath {
+    RelPath::of(&format!("{}\\{}", package_dir(host, word), game.host_dll))
+}
+
+/// A mod dllchain put into a package host's folder rather than the chain.
+fn is_package(m: &ModRec) -> bool {
+    !m.dll_at.is_top_level()
+}
+
+/// The loader in the game that runs DLL mods from folders of their own (ShroudForge): the game's `dinput8.dll`, or a
+/// mod on dllchain's list (an older dllchain chained ShroudForge like any other mod).
+fn package_host(ctx: &Ctx, scan: &Scan) -> Option<&'static PackageHost> {
+    let host = scan.host.as_ref().and_then(|(_, i)| i.word.as_ref()).map(|w| w.0.as_str());
+    let listed = scan.record.mods.iter().filter(|m| !is_package(m)).map(|m| m.word.as_str());
+    host.into_iter().chain(listed).find_map(|w| ctx.game.package_host(w))
 }
 
 /// Where a mod's DLL is now: where dllchain left it, `dinput8.dll`, or any chain entry with the same bytes (EMF
@@ -293,7 +323,10 @@ fn load_dll(ctx: &Ctx, scan: &Scan, m: &ModRec) -> Option<Vec<u8>> {
 struct Work<'a> {
     ctx: &'a Ctx,
     scan: &'a Scan,
+    /// The mods in the chain (or the host alone).
     mods: Vec<ModRec>,
+    /// The mods a package host runs from their own folders: never in the chain.
+    packages: Vec<ModRec>,
     dlls: HashMap<String, Vec<u8>>,
     plan: Plan,
     /// DLL files to delete before anything moves: (where, its SHA-256, the mod whose DLL it is or was).
@@ -310,6 +343,7 @@ impl<'a> Work<'a> {
             ctx,
             scan,
             mods: Vec::new(),
+            packages: Vec::new(),
             dlls: HashMap::new(),
             plan: Plan {
                 action,
@@ -322,6 +356,10 @@ impl<'a> Work<'a> {
             allow_no_host: false,
         };
         for m in &scan.record.mods {
+            if is_package(m) {
+                w.packages.push(m.clone());
+                continue;
+            }
             if let Some((_, bytes, info)) = scan.rebuilt(&m.word) {
                 w.plan.summary.push(format!(
                     "The {} in your game is not the copy dllchain kept, so dllchain keeps yours from now on.",
@@ -348,7 +386,7 @@ impl<'a> Work<'a> {
     }
 
     fn display(&self, word: &str) -> String {
-        match self.mods.iter().find(|m| m.word == word) {
+        match self.mods.iter().chain(&self.packages).find(|m| m.word == word) {
             Some(m) => name_of(self.ctx.game, m),
             None => self.ctx.game.display(word),
         }
@@ -357,7 +395,7 @@ impl<'a> Work<'a> {
     fn unique_word(&self, word: &str) -> String {
         let mut w = word.to_string();
         let mut n = 2;
-        while self.mods.iter().any(|m| m.word == w) {
+        while self.mods.iter().chain(&self.packages).any(|m| m.word == w) {
             w = format!("{word}-{n}");
             n += 1;
         }
@@ -375,6 +413,10 @@ impl<'a> Work<'a> {
         }
         let host = self.ctx.host();
         let word = info.word.as_ref().map(|w| w.0.clone());
+        // a package host runs its mods without a chain: it joins one only when there is one already
+        if self.mods.is_empty() && word.as_deref().is_some_and(|w| self.ctx.game.package_host(w).is_some()) {
+            return None;
+        }
         if word.is_some() && word.as_deref() == installing {
             self.plan.summary.push(format!(
                 "The new {} takes the place of the older copy in your game.",
@@ -418,6 +460,8 @@ impl<'a> Work<'a> {
             dll_sha: info.sha256.clone(),
             dll_at: host,
             replaced_dll: None,
+            version: info.version.as_deref().and_then(clean_name),
+            retired: Vec::new(),
             files: Vec::new(),
             dirs: Vec::new(),
         });
@@ -434,7 +478,14 @@ impl<'a> Work<'a> {
     }
 
     fn next_order(&self) -> u32 {
-        self.mods.iter().map(|m| m.order).max().unwrap_or(0).max(self.scan.record.next_order().saturating_sub(1)) + 1
+        self.mods
+            .iter()
+            .chain(&self.packages)
+            .map(|m| m.order)
+            .max()
+            .unwrap_or(0)
+            .max(self.scan.record.next_order().saturating_sub(1))
+            + 1
     }
 
     fn write_store(&mut self, word: &str, bytes: &[u8]) {
@@ -472,10 +523,14 @@ impl<'a> Work<'a> {
             self.mods.iter().position(|m| &m.word == word)
         });
 
+        // a loader that refuses every other DLL next to the game must stay dinput8.dll itself
+        let package_host = (0..n).find(|&i| ctx.game.package_host(&self.mods[i].word).is_some());
         let host_i = if emf || n == 0 {
             None
         } else if n == 1 {
             Some(0)
+        } else if package_host.is_some() {
+            package_host
         } else if let Some(h) = current.filter(|&h| can_host[h]) {
             Some(h)
         } else if let Some(h) = (0..n).filter(|&i| can_host[i]).max_by_key(|&i| self.mods[i].order) {
@@ -630,7 +685,8 @@ impl<'a> Work<'a> {
         // the chain file
         let mut chain = self.scan.chain.clone().unwrap_or_default();
         let before = chain.clone();
-        let mut ours: Vec<RelPath> = self.scan.record.mods.iter().map(|m| m.dll_at.clone()).collect();
+        let mut ours: Vec<RelPath> =
+            self.scan.record.mods.iter().filter(|m| !is_package(m)).map(|m| m.dll_at.clone()).collect();
         ours.extend(located.iter().flatten().cloned());
         ours.extend(self.drop.iter().map(|d| d.0.clone()));
         let guests: Vec<usize> = (0..n).filter(|&i| !targets[i].same(&host)).collect();
@@ -706,11 +762,31 @@ impl<'a> Work<'a> {
             }
         }
         self.plan.record = Record {
-            mods: self.mods.clone(),
+            mods: self.mods.iter().chain(&self.packages).cloned().collect(),
             chain_created: created,
             chain: chain.parse(ctx.game.host_dll).entries.iter().map(|e| (e.name.clone(), e.on)).collect(),
         };
         Ok(())
+    }
+
+    /// A single mod dllchain did not install, back as dinput8.dll with no chain: nothing left to keep track of, so it
+    /// leaves dllchain's list (the mods a package host runs from their own folders stay).
+    fn forget_lone_host(&mut self) {
+        let ctx = self.ctx;
+        let chained: Vec<usize> =
+            (0..self.plan.record.mods.len()).filter(|&i| !is_package(&self.plan.record.mods[i])).collect();
+        let [i] = chained[..] else { return };
+        let m = &self.plan.record.mods[i];
+        if m.kind != Kind::Adopted || !m.dll_at.same(&ctx.host()) {
+            return;
+        }
+        let m = self.plan.record.mods.remove(i);
+        let r = store_rel(&m.word, &m.dll_sha);
+        self.plan.steps.retain(|s| !matches!(s, Step::Write(x, _) if x.same(&r)));
+        if ctx.exists(&r) {
+            self.plan.steps.push(Step::Delete(r));
+        }
+        self.plan.record.chain.clear();
     }
 
     /// Writes the record last (or plans to remove dllchain's folder when nothing is left).
@@ -786,7 +862,11 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     if !is_word(&word) {
         fail!("{}: could not make a file name from it", src.label);
     }
-    let mut w = Work::new(ctx, &scan, format!("install {} (SHA-256 {})", src.label, src.sha256))?;
+    let action = format!("install {} (SHA-256 {})", src.label, src.sha256);
+    if let Some(ph) = package_host(ctx, &scan) {
+        return plan_install_package(ctx, &scan, src, &info, &word, ph, action);
+    }
+    let mut w = Work::new(ctx, &scan, action)?;
     let replaced_now = w.adopt_host(Some(&word));
     w.switch_on = Some(word.clone());
     let display = w.display(&word);
@@ -829,24 +909,20 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
             dll_sha: String::new(),
             dll_at: ctx.host(),
             replaced_dll: None,
+            version: None,
             files: Vec::new(),
+            retired: Vec::new(),
             dirs: Vec::new(),
         },
     };
     if replaced_now.is_some() {
         rec.replaced_dll = replaced_now;
     }
-    rec.at = clock::now_text();
-    rec.source_sha = src.sha256.clone();
-    rec.label = src.label.clone();
-    rec.from_url = src.from_url.clone();
-    if rec.name.is_none() {
-        rec.name = default_name(&info);
-    }
-    rec.dll_sha = info.sha256.clone();
+    fill_source(&mut rec, src, &info);
 
     let before = w.plan.summary.len();
-    plan_files(&mut w, &mut rec, src)?;
+    retire(&mut w, &mut rec, None, &src.files, None)?;
+    plan_files(&mut w, &mut rec, &src.files, &src.label, src.files.is_empty(), &|_| false)?;
     if let Some(i) = prev {
         w.mods[i] = rec;
     } else {
@@ -863,6 +939,51 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
         w.plan.summary.insert(0, l);
     }
     w.plan.summary.extend(file_lines);
+    source_notes(&mut w, src);
+    let files: Vec<&RelPath> = src.files.iter().map(|(r, _)| r).collect();
+    w.plan.missing = missing(ctx, &scan, &files);
+    Ok(w.finish())
+}
+
+/// What the install records about where the mod came from.
+fn fill_source(rec: &mut ModRec, src: &ModSource, info: &DllInfo) {
+    rec.at = clock::now_text();
+    rec.source_sha = src.sha256.clone();
+    rec.label = src.label.clone();
+    rec.from_url = src.from_url.clone();
+    if rec.name.is_none() {
+        rec.name = default_name(info);
+    }
+    rec.dll_sha = info.sha256.clone();
+    rec.version = info.version.as_deref().and_then(clean_name).or_else(|| version_in(&src.label));
+}
+
+/// A version in a file name: `SmartQuickStack-0.12.2-beta-03c1cbd.zip` gives `0.12.2-beta`. Only numbers with dots
+/// count (Nexus names keep the mod's number and dashes, which say nothing certain).
+pub fn version_in(label: &str) -> Option<String> {
+    let name = label.rsplit(['\\', '/']).next().unwrap_or(label);
+    let stem = name.strip_suffix(".zip").or_else(|| name.strip_suffix(".dll")).unwrap_or(name);
+    let b = stem.as_bytes();
+    let starts = (0..b.len())
+        .filter(|&i| b[i].is_ascii_digit() && (i == 0 || !b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'v'));
+    for i in starts {
+        let end = (i..b.len()).find(|&j| !(b[j].is_ascii_digit() || b[j] == b'.')).unwrap_or(b.len());
+        let num = stem[i..end].trim_end_matches('.');
+        if !num.contains('.') {
+            continue;
+        }
+        let rest = &stem[i + num.len()..];
+        let tag = ["-beta", "-alpha", "-rc"].into_iter().find(|t| rest.to_ascii_lowercase().starts_with(t));
+        return Some(match tag {
+            Some(t) => format!("{num}{t}"),
+            None => num.to_string(),
+        });
+    }
+    None
+}
+
+/// The notes about the zip's files that stay out of the game folder.
+fn source_notes(w: &mut Work, src: &ModSource) {
     for i in &src.ignored {
         w.plan.notes.push(format!("{i} is outside the mod's folder in the zip, so it is not installed"));
     }
@@ -876,29 +997,256 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
             "Licence, checksum and read-me files are for you, not the game, so they stay out of the game folder: {list}"
         ));
     }
-    let files: Vec<&RelPath> = src.files.iter().map(|(r, _)| r).collect();
-    w.plan.missing = missing(ctx, &scan, &files);
+}
+
+/// Installs (or updates) a mod into a package host's folder, `mods\<word>\`, where that loader runs it: the mod's
+/// files as its zip has them, without the off switch (`mod.json`), which would keep the folder switched off. The host
+/// itself is never changed. A mod an older dllchain chained (the host renamed) moves into the folder, and the host
+/// becomes `dinput8.dll` again.
+fn plan_install_package(
+    ctx: &Ctx,
+    scan: &Scan,
+    src: &ModSource,
+    info: &DllInfo,
+    word: &str,
+    ph: &'static PackageHost,
+    action: String,
+) -> Result<Plan> {
+    let mut w = Work::new(ctx, scan, action)?;
+    let host = ctx.game.display(ph.word);
+    let dir = package_dir(ph, word);
+    let dll_rel = package_dll(ctx.game, ph, word);
+    let (decl, off) = (RelPath::of(ph.declaration), RelPath::of(ph.off_switch));
+    let prev = w.packages.iter().position(|m| m.word == word);
+    let name = match prev {
+        Some(i) => name_of(ctx.game, &w.packages[i]),
+        None => default_name(info).unwrap_or_else(|| w.display(word)),
+    };
+    let dll_only = src.files.is_empty();
+    match src.files.iter().find(|(r, _)| r.same(&decl)) {
+        Some((_, b)) => check_declaration(b, ctx.game.host_dll).map_err(|e| Error(format!("{}: {e}", src.label)))?,
+        // a new DLL alone, for a mod that is in its folder already
+        None if dll_only && prev.is_some() => {}
+        None => fail!(
+            "{host} runs DLL mods only from a folder of their own in {}\\, and only when the mod says how, in a {decl} file. {} has none, so dllchain cannot install it with {host}. Add it with {host}'s DLL Manager instead.",
+            ph.dir,
+            src.label
+        ),
+    }
+    // a loader that stops the game at a folder in mods\ without mod.json (EML), other than the package host's own
+    for p in ctx.game.proxy_names {
+        let rel = RelPath::of(&format!("{p}.dll"));
+        let Some(b) = ctx.read(&rel) else { continue };
+        if inspect(&b, ctx.game).ok().and_then(|i| i.word).is_some_and(|(w, _)| w == ph.word) {
+            continue;
+        }
+        let strict = ctx.game.requirements.iter().find(|r| {
+            r.dir.eq_ignore_ascii_case(ph.dir)
+                && r.file.eq_ignore_ascii_case(ph.off_switch)
+                && r.texts.iter().any(|t| contains_text(&b, t))
+        });
+        if let Some(r) = strict {
+            fail!(
+                "{rel} is {}, not {host}'s own. {} stops the game at a folder in {}\\ without {off}, and {host} keeps a folder with {off} in it switched off, so {name} cannot run with both. Put {host}'s own {rel} back (install {host} again), then install {name}.",
+                r.short,
+                r.short,
+                ph.dir
+            );
+        }
+    }
+
+    let chained = w.mods.iter().position(|m| m.word == word);
+    let mut rec = match (prev, chained) {
+        (Some(i), _) => w.packages.remove(i),
+        (None, Some(i)) => {
+            let old = w.mods.remove(i);
+            if old.kind == Kind::Adopted {
+                fail!(
+                    "{name} is in the game folder from before dllchain (as {}), where {host} does not load it. Take it out by hand, then install it again.",
+                    old.dll_at
+                );
+            }
+            if let Some(at) = locate(ctx, scan, &old) {
+                w.drop.push((at, old.dll_sha.clone(), old.word.clone()));
+            }
+            w.plan.summary.push(format!(
+                "{name} moves from the game folder into {dir}\\, where {host} loads it ({host} loads no DLL next to the game)."
+            ));
+            if w.mods.iter().any(|m| m.word == ph.word && !m.dll_at.same(&ctx.host())) {
+                w.plan.summary.push(format!("{host} becomes {} again, as it needs to be.", ctx.game.host_dll));
+            }
+            if old.replaced_dll.is_some() {
+                w.plan.notes.push(format!(
+                    "Uninstall no longer puts your earlier copy of {name} back as {}: {host} needs that name.",
+                    ctx.game.host_dll
+                ));
+            }
+            ModRec { replaced_dll: None, ..old }
+        }
+        (None, None) => ModRec {
+            word: word.to_string(),
+            kind: Kind::Installed,
+            order: w.next_order(),
+            at: String::new(),
+            source_sha: String::new(),
+            label: String::new(),
+            name: None,
+            from_url: None,
+            dll_sha: String::new(),
+            dll_at: dll_rel.clone(),
+            replaced_dll: None,
+            version: None,
+            files: Vec::new(),
+            retired: Vec::new(),
+            dirs: Vec::new(),
+        },
+    };
+    let updating = prev.is_some();
+    if updating {
+        if rec.dll_sha == info.sha256 {
+            w.plan.notes.push(format!("{name} is already installed, so dllchain only checks its files"));
+        } else {
+            w.plan.summary.push(format!("{name} will be updated to the new version, in {dir}\\."));
+        }
+    } else if chained.is_none() {
+        w.plan.summary.push(format!("{name} will be added to {dir}\\, where {host} loads it."));
+    }
+    fill_source(&mut rec, src, info);
+    rec.dll_at = dll_rel.clone();
+
+    let mut files = vec![(dll_rel, src.dll.clone())];
+    for (r, b) in &src.files {
+        if !r.same(&off) {
+            files.push((dir.join(r.as_str())?, b.clone()));
+        }
+    }
+    retire(&mut w, &mut rec, Some(&dir), &files, Some((&dir.join(ph.off_switch)?, &host)))?;
+    plan_files(&mut w, &mut rec, &files, &src.label, dll_only, &|r| r.strip_prefix(&dir).is_some())?;
+    if chained.is_some() {
+        for l in w.plan.summary.iter_mut().filter(|l| l.starts_with("Deletes ")) {
+            *l = l.replace(", which the new version does not have", ", which it had next to the game");
+            *l = l.replace(" the new version does not have", " it had next to the game");
+        }
+    }
+    w.packages.push(rec);
+    w.layout()?;
+    w.forget_lone_host();
+    if src.files.iter().any(|(r, _)| r.same(&off)) {
+        w.plan.notes.push(format!(
+            "{off} from the zip is left out: with it, {host} keeps the folder switched off until you enable it."
+        ));
+    }
+    w.plan.notes.push(format!("{host} stays {} and dllchain does not change it.", ctx.game.host_dll));
+    source_notes(&mut w, src);
+    let rels: Vec<&RelPath> = files.iter().map(|(r, _)| r).collect();
+    w.plan.missing = missing(ctx, scan, &rels);
+    w.plan.name = name;
     Ok(w.finish())
 }
 
+/// A package host's declaration (`native-plugin.ini`) must load the DLL dllchain puts there, and be switched on.
+fn check_declaration(bytes: &[u8], dll: &str) -> Result<()> {
+    let text = String::from_utf8_lossy(bytes);
+    let value = |key: &str| {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            k.trim().eq_ignore_ascii_case(key).then(|| v.trim().trim_matches('"').to_string())
+        })
+    };
+    match value("Dll") {
+        Some(d) if d.trim_start_matches("./").trim_start_matches(".\\").eq_ignore_ascii_case(dll) => {}
+        Some(d) => fail!(
+            "its native-plugin.ini loads {d}, not the {dll} it ships, so dllchain cannot tell which DLL is the mod"
+        ),
+        None => fail!("its native-plugin.ini names no Dll"),
+    }
+    if value("Enabled").is_some_and(|e| e == "0" || e.eq_ignore_ascii_case("false")) {
+        fail!("its native-plugin.ini switches it off (Enabled=0)");
+    }
+    Ok(())
+}
+
+/// Takes out what an older version or a hand install left in the mod's folder (`None`: next to the game): the files
+/// the game's tool table says a newer version replaced, and a package host's off switch (with the host's name). Each
+/// is kept in dllchain's originals, and Uninstall puts it back. Files the mod's earlier install made are not these:
+/// [`plan_files`] takes those away.
+fn retire(
+    w: &mut Work,
+    rec: &mut ModRec,
+    folder: Option<&RelPath>,
+    shipped: &[(RelPath, Vec<u8>)],
+    off: Option<(&RelPath, &str)>,
+) -> Result<()> {
+    let ctx = w.ctx;
+    let at = |name: &str| match folder {
+        Some(d) => d.join(name),
+        None => RelPath::parse(name),
+    };
+    let ships = |r: &RelPath| shipped.iter().any(|(s, _)| s.same(r));
+    let mut out: Vec<(RelPath, String)> = Vec::new();
+    for l in ctx.game.tool(&rec.word).map_or(&[][..], |t| t.leftovers) {
+        let (old, new) = (at(l.old)?, at(l.new)?);
+        if ships(&new) && !ships(&old) {
+            out.push((old, format!("which an older version left (the new one uses {})", l.new)));
+        }
+    }
+    if let Some((o, host)) = off {
+        if !ships(o) {
+            out.push((
+                o.clone(),
+                format!("so {host} loads the mod (with it there, {host} keeps the folder switched off)"),
+            ));
+        }
+    }
+    for (rel, why) in out {
+        if rec.files.iter().chain(&rec.retired).any(|f| f.rel.same(&rel)) {
+            continue;
+        }
+        let Some(bytes) = ctx.read(&rel) else { continue };
+        let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", rec.word))?;
+        if ctx.exists(&backup) {
+            w.plan.notes.push(format!("{rel} stays: dllchain already keeps another copy of it in {backup}"));
+            continue;
+        }
+        let sha = sha256_hex(&bytes);
+        w.plan.steps.push(Step::Write(backup.clone(), bytes));
+        w.plan.steps.push(Step::Delete(rel.clone()));
+        w.plan.expect_files.push((backup.clone(), Some(sha.clone())));
+        w.plan.expect_files.push((rel.clone(), None));
+        w.plan.summary.push(format!("Takes out {rel}, {why}. dllchain keeps it, and Uninstall puts it back."));
+        rec.retired.push(FileRec { rel, sha, backup: Some(backup) });
+    }
+    Ok(())
+}
+
 /// The mod's other files: created, updated, kept when the player changed them, and the old version's leftovers.
-fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
+/// `earlier(rel)`: a file there now that dllchain did not install is the same mod's, from a copy put in by hand (it is
+/// kept and put back on uninstall like any file replaced, but asks for no leave to replace).
+fn plan_files(
+    w: &mut Work,
+    rec: &mut ModRec,
+    src_files: &[(RelPath, Vec<u8>)],
+    label: &str,
+    dll_only: bool,
+    earlier: &dyn Fn(&RelPath) -> bool,
+) -> Result<()> {
     let ctx = w.ctx;
     let prev_files = rec.files.clone();
     let mut files: Vec<FileRec> = Vec::new();
     let mut dirs = rec.dirs.clone();
-    let others: Vec<&ModRec> = w.mods.iter().filter(|m| m.word != rec.word).collect();
-    for (rel, bytes) in &src.files {
+    let mut by_hand: Vec<RelPath> = Vec::new();
+    let others: Vec<&ModRec> = w.mods.iter().chain(&w.packages).filter(|m| m.word != rec.word).collect();
+    for (rel, bytes) in src_files {
         check_target(rel, ctx.game)?;
         if others.iter().any(|m| m.files.iter().any(|f| f.rel.same(rel)) || m.dll_at.same(rel)) || rel.same(&ctx.host())
         {
-            fail!("{}: {rel} belongs to another mod on dllchain's list", src.label);
+            fail!("{label}: {rel} belongs to another mod on dllchain's list");
         }
         resolve(&ctx.dir, rel)?;
         let sha = sha256_hex(bytes);
         let now = ctx.sha(rel);
         if ctx.exists(rel) && now.is_none() {
-            fail!("{}: {rel} is a folder in the game folder, not a file", src.label);
+            fail!("{label}: {rel} is a folder in the game folder, not a file");
         }
         let prev = prev_files.iter().find(|f| f.rel.same(rel));
         for d in rel.ancestors() {
@@ -935,8 +1283,13 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
                 let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", rec.word))?;
                 let Some(old) = ctx.read(rel) else { fail!("could not read {rel}") };
                 debug_assert_eq!(sha256_hex(&old), n);
-                w.plan.replaces.push(rel.clone());
+                if earlier(rel) {
+                    by_hand.push(rel.clone());
+                } else {
+                    w.plan.replaces.push(rel.clone());
+                }
                 w.plan.steps.push(Step::Write(backup.clone(), old));
+                w.plan.expect_files.push((backup.clone(), Some(n)));
                 w.plan.steps.push(Step::Write(rel.clone(), bytes.clone()));
                 w.plan.expect_files.push((rel.clone(), Some(sha.clone())));
                 files.push(FileRec { rel: rel.clone(), sha, backup: Some(backup) });
@@ -948,7 +1301,6 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
     // Only a version that ships the mod's files can leave one out. A new DLL on its own (a fix, often downloaded
     // without the rest) keeps the files the earlier version installed; so does a licence or read-me the earlier
     // version put next to the game, which dllchain no longer installs.
-    let dll_only = src.files.is_empty();
     let mut carried: Vec<&RelPath> = Vec::new();
     for p in &prev_files {
         if files.iter().any(|f| f.rel.same(&p.rel)) {
@@ -972,13 +1324,28 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
     }
     let created: Vec<&RelPath> = files[..new_count.min(files.len())]
         .iter()
-        .filter(|f| !prev_files.iter().any(|p| p.rel.same(&f.rel)) && !w.plan.replaces.iter().any(|r| r.same(&f.rel)))
+        .filter(|f| {
+            !prev_files.iter().any(|p| p.rel.same(&f.rel))
+                && !w.plan.replaces.iter().any(|r| r.same(&f.rel))
+                && !by_hand.iter().any(|r| r.same(&f.rel))
+        })
         .map(|f| &f.rel)
         .collect();
     match created.len() {
         0 => {}
         1 => w.plan.summary.push(format!("Adds 1 more file: {}.", created[0])),
         k => w.plan.summary.push(format!("Adds {k} more files{}.", most_in(&created))),
+    }
+    match by_hand.len() {
+        0 => {}
+        1 => w
+            .plan
+            .summary
+            .push(format!("Updates {}, which you put there by hand. dllchain keeps that copy.", by_hand[0])),
+        k => w.plan.summary.push(format!(
+            "Updates {k} files you put there by hand{}. dllchain keeps those copies.",
+            most_in(&by_hand.iter().collect::<Vec<_>>())
+        )),
     }
     let replaced: Vec<&RelPath> = w.plan.replaces.iter().collect();
     match replaced.len() {
@@ -1002,7 +1369,13 @@ fn plan_files(w: &mut Work, rec: &mut ModRec, src: &ModSource) -> Result<()> {
     rec.files = files;
     dirs.sort_by_key(|d| d.key());
     dirs.dedup_by(|a, b| a.same(b));
-    rec.dirs = dirs;
+    // the folders dllchain made for the earlier version's files, which the new one has none in
+    let (used, gone): (Vec<RelPath>, Vec<RelPath>) =
+        dirs.into_iter().partition(|d| rec.files.iter().any(|f| f.rel.strip_prefix(d).is_some()));
+    for d in gone.into_iter().rev() {
+        w.plan.steps.push(Step::RemoveDirIfEmpty(d));
+    }
+    rec.dirs = used;
     Ok(())
 }
 
@@ -1122,7 +1495,18 @@ pub fn plan_repair(ctx: &Ctx) -> Result<Plan> {
     }
     w.adopt_host(None);
     w.layout()?;
-    for m in &w.mods {
+    if let Some(ph) = package_host(ctx, &scan) {
+        let host = ctx.game.display(ph.word);
+        for m in w.mods.iter().filter(|m| !m.dll_at.same(&ctx.host())) {
+            w.plan.notes.push(format!(
+                "{host} loads no DLL next to the game, so {} ({}) will not run. Install it again to move it into {}.",
+                name_of(ctx.game, m),
+                m.dll_at,
+                package_dir(ph, &m.word)
+            ));
+        }
+    }
+    for m in w.mods.iter().chain(&w.packages) {
         let missing: Vec<&RelPath> = m.files.iter().map(|f| &f.rel).filter(|r| !ctx.exists(r)).collect();
         let name = name_of(ctx.game, m);
         match missing.len() {
@@ -1166,6 +1550,100 @@ pub fn plan_rename(ctx: &Ctx, word: &str, name: Option<&str>) -> Result<Plan> {
     Ok(plan)
 }
 
+/// A run's action without the SHA-256 of the zip: "install x.zip".
+pub fn short_action(action: &str) -> &str {
+    action.split(" (SHA-256").next().unwrap_or(action)
+}
+
+/// Takes back the last change dllchain made (an install, an update, a repair, an uninstall of one mod), from the copies
+/// that run kept. Only while every file it changed is still as it left it; undoing an undo makes the change again.
+pub fn plan_undo(ctx: &Ctx) -> Result<Plan> {
+    let scan = scan(ctx)?;
+    let Some(run) = crate::txn::last_run(&ctx.dir)? else {
+        fail!("there is no change to undo: dllchain keeps the last one only, and none was made since this version");
+    };
+    if let Some(l) = run.unreadable.first() {
+        fail!("dllchain's note of the last change cannot be read in full ({l}), so it cannot be undone");
+    }
+    let when = clock::readable(&run.at);
+    let action = match run.action.strip_prefix("undo ") {
+        Some(a) => a.to_string(),
+        None => format!("undo {}", run.action),
+    };
+    let mut plan = Plan { action, notes: scan.notes.clone(), ..Plan::default() };
+    let mut restored = 0;
+    let mut deleted = 0;
+    // the record as it was before: `Some(None)` when the run made it
+    let mut record: Option<Option<Vec<u8>>> = None;
+    for c in &run.changes {
+        if c.rel.same(&RelPath::of(RECORD)) && c.before.is_none() {
+            record = Some(None);
+        }
+        if ctx.sha(&c.rel) != c.after {
+            fail!(
+                "{} changed after the last change ({}, {when}), so dllchain cannot take that change back without losing yours",
+                c.rel,
+                short_action(&run.action)
+            );
+        }
+        match &c.before {
+            Some((copy, sha)) => {
+                let Some(bytes) = ctx.read(copy).filter(|b| sha256_hex(b) == *sha) else {
+                    fail!("dllchain's copy of {} from before the last change is gone, so it cannot be undone", c.rel);
+                };
+                if c.after.as_deref() == Some(sha.as_str()) {
+                    continue;
+                }
+                if c.rel.same(&RelPath::of(RECORD)) {
+                    record = Some(Some(bytes.clone()));
+                }
+                plan.expect_files.push((c.rel.clone(), Some(sha.clone())));
+                plan.steps.push(Step::Write(c.rel.clone(), bytes));
+                restored += 1;
+            }
+            None => {
+                if c.after.is_none() {
+                    continue;
+                }
+                plan.expect_files.push((c.rel.clone(), None));
+                plan.steps.push(Step::Delete(c.rel.clone()));
+                deleted += 1;
+            }
+        }
+        if !c.rel.first_part().eq_ignore_ascii_case(OWN_DIR) {
+            let how = if c.before.is_some() { "put back" } else { "deleted" };
+            plan.files.push(format!("{} ({how})", c.rel));
+        }
+    }
+    for d in run.made_dirs.iter().rev() {
+        plan.steps.push(Step::RemoveDirIfEmpty(d.clone()));
+    }
+    plan.record = match record {
+        Some(Some(b)) => {
+            let (r, warn) = Record::parse(&String::from_utf8_lossy(&b));
+            if !warn.is_empty() {
+                fail!("dllchain's record from before the last change cannot be read in full, so it cannot be undone");
+            }
+            r
+        }
+        Some(None) => Record::default(),
+        None => scan.record.clone(),
+    };
+    plan.files.sort();
+    plan.summary.push(format!("Takes back the last change: {} ({when}).", short_action(&run.action)));
+    let count = |k: usize, what: &str| match k {
+        0 => None,
+        1 => Some(format!("{what} 1 file")),
+        k => Some(format!("{what} {k} files")),
+    };
+    let parts: Vec<String> = [count(restored, "puts back"), count(deleted, "deletes")].into_iter().flatten().collect();
+    if !parts.is_empty() {
+        plan.summary.push(format!("It {}, so they are as they were before.", parts.join(" and ")));
+    }
+    plan.summary.push("You can take this back too: Undo again makes the change again.".into());
+    Ok(plan)
+}
+
 /// The name players see: the one the player gave, else the DLL's product name, else the known tool's name or the
 /// file-name word.
 pub fn name_of(game: &Game, m: &ModRec) -> String {
@@ -1188,6 +1666,7 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
     w.plan.first_install = false;
     w.adopt_host(None);
     let targets: Vec<String> = match word {
+        Some(x) if w.packages.iter().any(|m| m.word == x) => vec![x.to_string()],
         Some(x) => match w.mods.iter().find(|m| m.word == x) {
             None => fail!("{x} is not on dllchain's list"),
             Some(m) if m.kind == Kind::Adopted => fail!(
@@ -1197,23 +1676,29 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
             ),
             Some(m) => vec![m.word.clone()],
         },
-        None => w.mods.iter().filter(|m| m.kind == Kind::Installed).map(|m| m.word.clone()).collect(),
+        None => {
+            w.mods.iter().chain(&w.packages).filter(|m| m.kind == Kind::Installed).map(|m| m.word.clone()).collect()
+        }
     };
     w.allow_no_host = word.is_none();
     for t in &targets {
-        let i = w.mods.iter().position(|m| &m.word == t).expect("listed");
-        let m = w.mods.remove(i);
+        let m = match w.packages.iter().position(|m| &m.word == t) {
+            Some(i) => w.packages.remove(i),
+            None => w.mods.remove(w.mods.iter().position(|m| &m.word == t).expect("listed")),
+        };
         let display = name_of(ctx.game, &m);
         if word.is_some() {
             w.plan.name = display.clone();
         }
-        let at = locate(ctx, &scan, &m);
+        // a package's DLL is one of its files
+        let at = if is_package(&m) { None } else { locate(ctx, &scan, &m) };
         let mut kept = Vec::new();
         let mut undone = Undone::default();
         for f in m.files.iter().rev() {
             undone.add(undo_file(&mut w, f, &mut kept), f);
         }
         w.plan.summary.push(format!("{display} will be removed from your game."));
+        put_back_retired(&mut w, &m);
         let mut deleted: Vec<&RelPath> = at.iter().collect();
         deleted.extend(&undone.deleted);
         match deleted.len() {
@@ -1249,6 +1734,8 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
                         dll_sha: r.clone(),
                         dll_at: ctx.host(),
                         replaced_dll: None,
+                        version: None,
+                        retired: Vec::new(),
                         files: Vec::new(),
                         dirs: Vec::new(),
                     });
@@ -1261,22 +1748,31 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
         }
     }
     w.layout()?;
-    // a single mod dllchain did not install, back as dinput8.dll and unlisted: nothing left to keep track of
-    if w.plan.record.mods.len() == 1
-        && w.plan.record.mods[0].kind == Kind::Adopted
-        && w.plan.record.mods[0].dll_at.same(&ctx.host())
-    {
-        let m = w.plan.record.mods.remove(0);
-        let r = store_rel(&m.word, &m.dll_sha);
-        if ctx.exists(&r) || w.plan.steps.iter().any(|s| matches!(s, Step::Write(x, _) if x.same(&r))) {
-            w.plan.steps.retain(|s| !matches!(s, Step::Write(x, _) if x.same(&r)));
-            if ctx.exists(&r) {
-                w.plan.steps.push(Step::Delete(r));
-            }
-        }
-        w.plan.record.chain.clear();
-    }
+    w.forget_lone_host();
     Ok(w.finish())
+}
+
+/// Puts back the files an install took out of the mod's folder (an older version's leftovers, a package host's off
+/// switch), unless something is in their place again.
+fn put_back_retired(w: &mut Work, m: &ModRec) {
+    let ctx = w.ctx;
+    for f in &m.retired {
+        let Some(backup) = &f.backup else { continue };
+        let Some(bytes) = ctx.read(backup).filter(|b| sha256_hex(b) == f.sha) else {
+            w.plan.notes.push(format!("dllchain's copy of {} is gone, so it cannot be put back", f.rel));
+            continue;
+        };
+        if ctx.exists(&f.rel) {
+            w.plan
+                .notes
+                .push(format!("{} is there again, so dllchain leaves it and keeps the old one in {backup}", f.rel));
+            continue;
+        }
+        w.plan.summary.push(format!("Puts back {}, which was there before.", f.rel));
+        w.plan.expect_files.push((f.rel.clone(), Some(f.sha.clone())));
+        w.plan.steps.push(Step::Write(f.rel.clone(), bytes));
+        w.plan.steps.push(Step::Delete(backup.clone()));
+    }
 }
 
 /// Makes the plan's changes, checks the folder, and undoes everything when a step or the check fails.
@@ -1290,7 +1786,7 @@ pub fn apply(ctx: &Ctx, plan: &Plan) -> Result<Vec<String>> {
         id = format!("{}-{k}", clock::now_stamp());
         k += 1;
     }
-    let mut t = Txn::begin(&ctx.dir, &id)?;
+    let mut t = Txn::begin(&ctx.dir, &id, &plan.action)?;
     let run = |t: &mut Txn| -> Result<()> {
         for (n, step) in plan.steps.iter().enumerate() {
             if plan.fail_after == Some(n) {
@@ -1433,6 +1929,21 @@ pub struct Row {
     /// Everything dllchain knows about it, for the details pane: (label, value) lines; an empty label carries on the
     /// line above.
     pub details: Vec<(String, String)>,
+    /// Its version: from the DLL, else from the zip's name.
+    pub version: Option<String>,
+    /// Whether it loaded at the game's last start, for a mod whose log dllchain knows.
+    pub load: Option<(Load, String)>,
+}
+
+/// What a mod's log says about the game's last start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Load {
+    Loaded,
+    /// It loaded, and says the player switched its main part off.
+    Off,
+    NotLoaded,
+    /// The game has not started since the mod was installed.
+    NotYet,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1441,6 +1952,65 @@ pub struct Status {
     pub notes: Vec<String>,
     /// What a repair would change (empty: nothing to repair).
     pub repair: Vec<String>,
+    /// The last change, which Undo takes back: what it was and when (local time).
+    pub undo: Option<(String, String)>,
+    /// The loader that runs mods from folders of their own, when the game has one: its name and that folder (`mods`).
+    pub package_host: Option<(String, String)>,
+}
+
+/// The numbers of a version, without a tag: `0.12.2-beta` and `v0.12.2` are both `0.12.2`.
+fn version_numbers(v: &str) -> &str {
+    let v = v.trim().trim_start_matches(['v', 'V']);
+    let end = v.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(v.len());
+    v[..end].trim_end_matches('.')
+}
+
+/// Whether the mod whose DLL is `dll` loaded at the game's last start, from its own log next to it. The game writes
+/// its log at every start, so a game log newer than the DLL with no newer mod log means it did not load.
+pub fn load_check(ctx: &Ctx, word: &str, dll: &RelPath, version: Option<&str>) -> Option<(Load, String)> {
+    let log = ctx.game.tool(word)?.log.as_ref()?;
+    let log_rel = match dll.as_str().rsplit_once('\\') {
+        Some((dir, _)) => RelPath::parse(&format!("{dir}\\{}", log.file)).ok()?,
+        None => RelPath::of(log.file),
+    };
+    let installed = ctx.modified(dll)?;
+    let game_started = ctx.modified(&RelPath::of(ctx.game.game_log)).is_some_and(|t| t > installed);
+    let fresh = ctx.modified(&log_rel).is_some_and(|t| t >= installed);
+    if !fresh {
+        return Some(if game_started {
+            (Load::NotLoaded, format!("did not load at the game's last start: {log_rel} has nothing from it"))
+        } else {
+            (Load::NotYet, "not started yet: start the game once, and dllchain can tell whether it loaded".into())
+        });
+    }
+    let text = ctx.read(&log_rel).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let logged = lines.next().and_then(|l| l.find(log.first).map(|i| l[i + log.first.len()..].trim().to_string()));
+    let Some(logged) = logged else {
+        return Some((
+            Load::NotLoaded,
+            format!("did not load at the game's last start: {log_rel} does not start as it should"),
+        ));
+    };
+    if let Some(v) = version.filter(|v| version_numbers(v) != version_numbers(&logged)) {
+        return Some((
+            Load::NotLoaded,
+            format!(
+                "an older copy ran at the game's last start: {log_rel} says {logged}, not {v}. Another copy may be in the game folder"
+            ),
+        ));
+    }
+    let rest: Vec<&str> = lines.collect();
+    if rest.iter().any(|l| l.contains(log.ok)) {
+        Some((Load::Loaded, format!("loaded at the game's last start ({logged})")))
+    } else if rest.iter().any(|l| l.contains(log.off)) {
+        Some((Load::Off, format!("loaded at the game's last start ({logged}), but its log says it is switched off")))
+    } else {
+        Some((
+            Load::NotLoaded,
+            format!("started at the game's last start ({logged}) but did not finish loading: see {log_rel}"),
+        ))
+    }
 }
 
 /// Every proxy DLL next to the game and every chain entry, with its SHA-256 and where it came from.
@@ -1534,6 +2104,15 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             if m.word != name {
                 details.push(pair("Short name", m.word.clone()));
             }
+            let dll_version = || ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok()).and_then(|i| i.version);
+            let version = m.version.clone().or_else(dll_version);
+            let load = load_check(ctx, &m.word, rel, version.as_deref());
+            if let Some(v) = &version {
+                details.insert(1, pair("Version", v.clone()));
+            }
+            if let Some((_, l)) = &load {
+                details.insert(1 + usize::from(version.is_some()), pair("Last start", l.clone()));
+            }
             return Row {
                 file: rel.clone(),
                 word: Some(m.word.clone()),
@@ -1545,6 +2124,8 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                 installed: m.kind == Kind::Installed,
                 page: m.from_url.clone(),
                 details,
+                version,
+                load,
             };
         }
         let info = ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok());
@@ -1567,9 +2148,21 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             "not installed by dllchain"
         };
         details.push(pair("From", format!("{from}; not on dllchain's list")));
+        let package_host = info.as_ref().and_then(|i| i.word.as_ref()).and_then(|w| ctx.game.package_host(&w.0));
         if rel.same(&host) && scan.record.is_empty() {
-            details.push(pair("", "dllchain leaves it as it is. When you install another mod,".into()));
-            details.push(pair("", "it joins the chain and dllchain keeps a copy of it.".into()));
+            details.push(pair("", "dllchain leaves it as it is.".into()));
+            match package_host {
+                Some(ph) => details
+                    .push(pair("", format!("A mod you install goes into {}\\<mod>\\, where {name} loads it.", ph.dir))),
+                None => {
+                    details.push(pair("", "When you install another mod, it joins the chain".into()));
+                    details.push(pair("", "and dllchain keeps a copy of it.".into()));
+                }
+            }
+        }
+        let version = info.as_ref().and_then(|i| i.version.clone());
+        if let Some(v) = &version {
+            details.push(pair("Version", v.clone()));
         }
         if let Some(p) = info.as_ref().and_then(|i| i.product_name.clone()) {
             details.push(pair("Product name", p));
@@ -1586,6 +2179,8 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             installed: false,
             page: None,
             details,
+            version,
+            load: None,
         }
     };
     if ctx.exists(&host) {
@@ -1609,6 +2204,26 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         let mut r = row(&rel, "another loader's DLL, left alone".into());
         r.source = "not installed by dllchain".into();
         st.rows.push(r);
+    }
+    let ph = package_host(ctx, &scan);
+    st.package_host = ph.map(|p| (ctx.game.display(p.word), p.dir.to_string()));
+    if let Some(ph) = ph {
+        // an older dllchain chained mods with the package host, which runs none of them
+        let host = ctx.game.display(ph.word);
+        for m in scan.record.mods.iter().filter(|m| !is_package(m) && m.word != ph.word) {
+            st.notes.push(format!(
+                "{} does not run: {host} loads no DLL next to the game. Install it again, and dllchain moves it into {}, where {host} loads it.",
+                name_of(ctx.game, m),
+                package_dir(ph, &m.word)
+            ));
+        }
+    }
+    let loader = st.package_host.as_ref().map_or("its loader", |p| p.0.as_str()).to_string();
+    for m in scan.record.mods.iter().filter(|m| is_package(m)) {
+        st.rows.push(row(&m.dll_at, format!("loaded by {loader} from its own folder")));
+    }
+    if let Ok(Some(run)) = crate::txn::last_run(&ctx.dir) {
+        st.undo = Some((short_action(&run.action).to_string(), clock::readable(&run.at)));
     }
     match plan_repair(ctx) {
         Ok(p) if !p.is_empty() => st.repair = p.summary,

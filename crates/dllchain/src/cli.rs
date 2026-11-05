@@ -3,7 +3,7 @@
 mod common;
 mod update;
 
-use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_uninstall, status};
+use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source};
 use common::{GAME, Opts, describe, details_text, shown};
@@ -18,6 +18,7 @@ dllchain-cli: installs several dinput8.dll mods side by side, and takes them out
   dllchain-cli uninstall <name> | --all [--yes]
   dllchain-cli rename <name> <new name> [--yes]   (\"\" gives the mod its own name back)
   dllchain-cli repair [--yes]
+  dllchain-cli undo [--yes]   (takes back the last change; undo again to make it again)
   dllchain-cli check-update   (asks GitHub for the newest version; nothing else is sent)
 
   <name> is the mod's file-name word, as `status` shows it (\"enstash\", \"auto-loot-plus\").
@@ -35,6 +36,7 @@ enum Cmd {
     Uninstall(Option<String>),
     Rename(String, String),
     Repair,
+    Undo,
     CheckUpdate,
 }
 
@@ -69,6 +71,7 @@ fn parse(args: Vec<String>) -> std::result::Result<Args, String> {
     let cmd = match (free.first().map(String::as_str), free.len(), all) {
         (Some("status"), 1, false) => Cmd::Status,
         (Some("repair"), 1, false) => Cmd::Repair,
+        (Some("undo"), 1, false) => Cmd::Undo,
         (Some("check-update"), 1, false) => Cmd::CheckUpdate,
         (Some("install"), 2, false) => Cmd::Install(PathBuf::from(&free[1])),
         (Some("uninstall"), 2, false) => Cmd::Uninstall(Some(free[1].clone())),
@@ -117,6 +120,7 @@ fn run(a: &Args) -> Result<Outcome> {
         Cmd::Uninstall(w) => plan_uninstall(&ctx, w.as_deref())?,
         Cmd::Rename(w, n) => plan_rename(&ctx, w, Some(n))?,
         Cmd::Repair => plan_repair(&ctx)?,
+        Cmd::Undo => plan_undo(&ctx)?,
         Cmd::CheckUpdate => unreachable!("handled above"),
     };
     print!("\n{}", describe(&plan));
@@ -149,7 +153,8 @@ fn print_status(ctx: &Ctx) -> Result<()> {
     for r in &st.rows {
         let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());
         let word = r.word.as_deref().map_or(String::new(), |w| format!(" ({w})"));
-        println!("\n{}{word}  {}  [{}]  SHA-256 {sha}", r.name, r.file, r.role);
+        let version = r.version.as_deref().map_or(String::new(), |v| format!(" {v}"));
+        println!("\n{}{version}{word}  {}  [{}]  SHA-256 {sha}", r.name, r.file, r.role);
         for l in details_text(&r.details, false).lines() {
             println!("    {l}");
         }
@@ -159,6 +164,9 @@ fn print_status(ctx: &Ctx) -> Result<()> {
     }
     for n in &st.notes {
         println!("Note: {n}");
+    }
+    if let Some((what, when)) = &st.undo {
+        println!("Last change: {what} ({when}). `dllchain-cli undo` takes it back.");
     }
     if st.repair.is_empty() {
         println!("Nothing to repair.");

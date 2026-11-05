@@ -40,6 +40,9 @@ Close the game and Steam first; dllchain changes nothing while either runs.
   When the mod is also a script package for the [Enshrouded Mod Loader (EML)](https://brabb3l.github.io/kfc-parser/eml/usage.html) (it ships `mods\<name>\mod.json`) and EML is not installed, dllchain says so, with a link to EML's page.
   It installs the mod anyway and never downloads EML itself.
 - **Uninstall** or **Uninstall all** take mods out again.
+- **Undo** takes back the last change (an install, an update, an uninstall, a repair or a rename), from the copies dllchain kept of every file it changed.
+  Press Undo again to make the change again.
+  When a file was changed by hand after that change, Undo refuses rather than lose your edit.
 - **Repair** fixes the chain after another mod's `dinput8.dll` was copied over a chained one.
   A chained mod you replaced by hand with a newer build of the same mod is kept, not put back: dllchain keeps a copy of your build from then on.
 - **Rename** (or F2) changes the name a mod is shown under; no file is renamed.
@@ -48,9 +51,11 @@ Close the game and Steam first; dllchain changes nothing while either runs.
   An update that is only the new `dinput8.dll` keeps the mod's other files from the earlier version; only a full new version can leave files out, and the question says which go.
 - **Help > Check for updates** asks GitHub whether a newer dllchain is out and offers to open its page.
   dllchain never downloads or installs anything by itself.
-- Select a mod to see everything dllchain knows about it: when it was installed, from which file and website, its SHA-256 and the files it added.
+- Select a mod to see everything dllchain knows about it: when it was installed, from which file and website, its version, its SHA-256 and the files it added.
+  The version comes from the DLL's version information, or else from the zip's name (`SmartQuickStack-0.12.2-beta.zip` is 0.12.2-beta).
+- For a mod that writes a log dllchain knows (such as enstash), the list also says whether it loaded at the game's last start, and says plainly when it did not.
 
-Every change is shown first, in plain words, and only made after you press Install, Uninstall or Repair.
+Every change is shown first, in plain words, and only made after you press Install, Uninstall, Repair or Undo.
 **Show details** in that question shows the mod's SHA-256 and the first files that change; `dllchain\installer.log` in the game folder lists every one.
 The same actions are on the command line in `dllchain-cli.exe`:
 
@@ -60,6 +65,7 @@ dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
 dllchain-cli uninstall <name> | --all [--yes]
 dllchain-cli rename <name> <new name> [--yes]
 dllchain-cli repair [--yes]
+dllchain-cli undo [--yes]
 dllchain-cli check-update
 ```
 
@@ -69,6 +75,12 @@ Without `--yes` it only shows what it would do.
 
 - One mod that can start others becomes `dinput8.dll`; every other mod is renamed to `<name>.dll` and listed in `dinput8-chain.ini`.
 - When a mod loader that hosts every mod is installed, it stays `dinput8.dll` and every mod is chained behind it; dllchain never touches the loader's own files.
+- When ShroudForge is installed, it stays `dinput8.dll` and each mod goes into a folder of its own, `mods\<name>\`, where ShroudForge loads it; no chain is used.
+  The mod must ship a `native-plugin.ini` that says which DLL to load, as enstash does, or dllchain refuses it and changes nothing.
+  A `mod.json` from the zip is left out of that folder, as ShroudForge does not load a native mod from a folder that has one.
+  A mod that an older dllchain chained next to ShroudForge, where it never ran, is moved into its folder when you install it again.
+- A file an older version of a mod left behind and the new version no longer reads (such as enstash's `enstash-data.txt` once `enstash-data.dat` is there) is taken out on install, kept in `dllchain\originals\`, and put back on uninstall.
+  Your own files next to a mod (its marks, settings, `.off` switches, backups and logs) are never touched.
 - A `dinput8.dll` that was already there, put in by hand or by another tool, is left as it is until you install another mod; then it joins the chain, and uninstalling gives it back.
 - A file it replaces is copied to `dllchain\originals\` first, and put back on uninstall.
 - What it installed is listed in `dllchain\record.txt`, and each run is logged in `dllchain\installer.log`.
@@ -79,9 +91,10 @@ Without `--yes` it only shows what it would do.
 
 dllchain sends nothing anywhere, except when you check for updates: then it asks GitHub for the newest version number, and nothing about your PC or game goes with it.
 
-It never writes programs (`.exe`), game data, Steam's files or another loader's folder, and never writes outside the game folder (apart from that one save copy).
+It never writes programs (`.exe`), game data, Steam's files or another loader's own files, and never writes outside the game folder (apart from that one save copy).
 Uninstall removes only what dllchain created, and gives back the rest byte for byte.
 If a run fails or is cut off, everything it changed is undone, from `dllchain\journal.txt`, before anything else happens.
+The last finished run is kept in `dllchain\undo.txt`, with copies of what it changed, so Undo can take it back.
 
 dllchain does not trust its own record: a mod could have edited it.
 Entries that point at a protected file, outside the game folder, or at anything dllchain could not have made are dropped with a note.

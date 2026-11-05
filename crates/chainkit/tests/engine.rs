@@ -3,7 +3,10 @@
 
 use chainkit::chainini::ChainFile;
 use chainkit::dllinfo::fake_dll;
-use chainkit::engine::{Ctx, Plan, apply, plan_install, plan_rename, plan_repair, plan_uninstall, status};
+use chainkit::engine::{
+    Ctx, Load, Plan, Row, Status, apply, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status,
+    version_in,
+};
 use chainkit::game::ENSHROUDED;
 use chainkit::hash::sha256_hex;
 use chainkit::paths::RelPath;
@@ -523,7 +526,7 @@ fn an_unfinished_run_blocks_until_it_is_undone() {
     let dir = game("journal");
     let c = ctx(&dir);
     install(&c, &src("alp.zip", alp(), &[]));
-    let t = chainkit::txn::Txn::begin(&dir, "cut").unwrap();
+    let t = chainkit::txn::Txn::begin(&dir, "cut", "test").unwrap();
     drop(t);
     assert!(plan_install(&c, &src("xhl.zip", xhl(), &[])).is_err());
     assert!(c.recover().unwrap().is_some());
@@ -843,4 +846,382 @@ fn an_eml_package_warns_only_while_eml_is_missing() {
     let c = ctx(&dir);
     let p = install(&c, &src("Shiny.zip", shiny(), &[("shiny.txt", b"settings"), (r"mods\mod.json", b"{}")]));
     assert_eq!(needs(&c, &p, "shiny-mod"), (vec![], vec![]));
+}
+
+// ---- every layout enstash meets: alone, chained with Auto Loot Plus, under ShroudForge, next to EML ----
+
+const ENSTASH_ZIP: &str = "SmartQuickStack-0.12.2-beta-03c1cbd.zip";
+const PLUGIN_INI: &[u8] = b"[Plugin]\r\nEnabled=1\r\nDll=dinput8.dll\r\n";
+
+/// enstash's zip as its release script makes it: the DLL, its data, an EML package's mod.json, ShroudForge's
+/// native-plugin.ini and licences, all at the top.
+fn enstash_zip(dll: Vec<u8>, data: &[u8]) -> ModSource {
+    src(
+        ENSTASH_ZIP,
+        dll,
+        &[
+            ("enstash-data.dat", data),
+            ("mod.json", b"{\"id\":\"enstash\"}"),
+            ("native-plugin.ini", PLUGIN_INI),
+            ("licenses\\enstash-zstd-LICENSE.txt", b"licence"),
+        ],
+    )
+}
+
+/// The player's own files next to enstash's DLL, which no install or uninstall may touch.
+fn enstash_user_files(dir: &Path) {
+    std::fs::create_dir_all(dir.join("enstash-backups")).unwrap();
+    std::fs::write(dir.join("enstash-marks.txt"), b"my marks").unwrap();
+    std::fs::write(dir.join("enstash-quickstack.off"), b"").unwrap();
+    std::fs::write(dir.join("enstash-settings.ini"), b"radius=20").unwrap();
+    std::fs::write(dir.join("enstash-quickstack.log"), b"an old log").unwrap();
+    std::fs::write(dir.join("enstash-backups\\marks-1.txt"), b"backup").unwrap();
+}
+
+fn user_files_kept(dir: &Path) {
+    assert_eq!(read(dir, "enstash-marks.txt").as_deref(), Some(&b"my marks"[..]));
+    assert_eq!(read(dir, "enstash-quickstack.off").as_deref(), Some(&b""[..]));
+    assert_eq!(read(dir, "enstash-settings.ini").as_deref(), Some(&b"radius=20"[..]));
+    assert_eq!(read(dir, "enstash-quickstack.log").as_deref(), Some(&b"an old log"[..]));
+    assert_eq!(read(dir, "enstash-backups\\marks-1.txt").as_deref(), Some(&b"backup"[..]));
+}
+
+/// ShroudForge 1.7.8 as its installer leaves it: its loader under three proxy names, its folder and its packages.
+fn shroudforge(dir: &Path) -> Vec<u8> {
+    let sf = fake_dll(&["shroudforge", "EML_LOG_FILE_PATH"], None);
+    for n in ["dinput8.dll", "dbghelp.dll", "winmm.dll"] {
+        std::fs::write(dir.join(n), &sf).unwrap();
+    }
+    std::fs::create_dir_all(dir.join("mods\\sf-survival")).unwrap();
+    std::fs::write(dir.join("mods\\sf-survival\\mod.json"), b"{}").unwrap();
+    std::fs::create_dir_all(dir.join("shroudforge")).unwrap();
+    std::fs::write(dir.join("shroudforge\\settings.json"), b"{}").unwrap();
+    sf
+}
+
+fn row<'a>(st: &'a Status, word: &str) -> &'a Row {
+    st.rows.iter().find(|r| r.word.as_deref() == Some(word)).unwrap_or_else(|| panic!("no row for {word}"))
+}
+
+#[test]
+fn enstash_alone_takes_out_the_old_data_file_and_gives_it_back() {
+    let dir = game("enstash-alone");
+    enstash_user_files(&dir);
+    // an older enstash, put there by hand, read its item data from a text file
+    std::fs::write(dir.join("enstash-data.txt"), b"old data").unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+
+    let p = install(&c, &enstash_zip(enstash(), b"dat"));
+    assert!(p.summary.iter().any(|l| l.starts_with("Takes out enstash-data.txt")), "{:?}", p.summary);
+    assert!(p.replaces.is_empty());
+    assert_eq!(read(&dir, "dinput8.dll"), Some(enstash()));
+    assert_eq!(read(&dir, "enstash-data.txt"), None);
+    assert_eq!(read(&dir, "enstash-data.dat").as_deref(), Some(&b"dat"[..]));
+    user_files_kept(&dir);
+    assert_eq!(row(&status(&c).unwrap(), "enstash").version.as_deref(), Some("0.12.2-beta"));
+
+    // an update that still ships the .dat: the .txt stays out
+    install(&c, &enstash_zip(enstash2(), b"dat 2"));
+    assert_eq!(read(&dir, "enstash-data.txt"), None);
+    user_files_kept(&dir);
+
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn enstash_chained_with_auto_loot_plus_and_back() {
+    let dir = game("enstash-alp");
+    enstash_user_files(&dir);
+    std::fs::write(dir.join("enstash-data.txt"), b"old data").unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    install(&c, &src("AutoLootPlus-1-1-8.zip", alp(), &[("mods\\alp\\config.txt", b"cfg")]));
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash()));
+    assert_eq!(chain(&dir), vec![("enstash.dll".to_string(), true)]);
+    assert_eq!(read(&dir, "enstash-data.txt"), None);
+    user_files_kept(&dir);
+
+    // an update keeps its place in the chain
+    install(&c, &enstash_zip(enstash2(), b"dat 2"));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash2()));
+    assert_eq!(chain(&dir), vec![("enstash.dll".to_string(), true)]);
+
+    run(&c, plan_uninstall(&c, Some("enstash")));
+    assert_eq!(read(&dir, "enstash-data.txt").as_deref(), Some(&b"old data"[..]));
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn under_shroudforge_enstash_goes_into_its_own_folder_without_mod_json() {
+    let dir = game("shroudforge");
+    let sf = shroudforge(&dir);
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+
+    let p = install(&c, &enstash_zip(enstash(), b"dat"));
+    assert!(p.replaces.is_empty());
+    assert!(p.notes.iter().any(|n| n.starts_with("mod.json from the zip is left out")), "{:?}", p.notes);
+    // ShroudForge and its packages as they were; nothing next to the game, no chain file
+    for n in ["dinput8.dll", "dbghelp.dll", "winmm.dll"] {
+        assert_eq!(read(&dir, n), Some(sf.clone()), "{n}");
+    }
+    assert_eq!(read(&dir, "dinput8-chain.ini"), None);
+    for n in ["enstash.dll", "mod.json", "native-plugin.ini", "enstash-data.dat", "licenses"] {
+        assert!(!dir.join(n).exists(), "{n}");
+    }
+    let pkg = dir.join("mods\\enstash");
+    assert_eq!(read(&pkg, "dinput8.dll"), Some(enstash()));
+    assert_eq!(read(&pkg, "native-plugin.ini").as_deref(), Some(PLUGIN_INI));
+    assert_eq!(read(&pkg, "enstash-data.dat").as_deref(), Some(&b"dat"[..]));
+    assert_eq!(read(&pkg, "licenses\\enstash-zstd-LICENSE.txt").as_deref(), Some(&b"licence"[..]));
+    assert!(!pkg.join("mod.json").exists());
+    let st = status(&c).unwrap();
+    let r = row(&st, "enstash");
+    assert_eq!(r.file.as_str(), "mods\\enstash\\dinput8.dll");
+    assert_eq!(r.role, "loaded by ShroudForge from its own folder");
+    assert_eq!(r.version.as_deref(), Some("0.12.2-beta"));
+    assert!(st.repair.is_empty(), "{:?}", st.repair);
+
+    // the player's files in its folder stay through an update, and the update stays in the folder
+    enstash_user_files(&pkg);
+    let p = install(&c, &enstash_zip(enstash2(), b"dat 2"));
+    assert!(p.replaces.is_empty());
+    assert_eq!(read(&pkg, "dinput8.dll"), Some(enstash2()));
+    assert_eq!(read(&pkg, "enstash-data.dat").as_deref(), Some(&b"dat 2"[..]));
+    assert!(!pkg.join("mod.json").exists());
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf.clone()));
+    user_files_kept(&pkg);
+    // a new DLL alone keeps the rest
+    install(&c, &src("dinput8.dll", enstash(), &[]));
+    assert_eq!(read(&pkg, "dinput8.dll"), Some(enstash()));
+    assert_eq!(read(&pkg, "native-plugin.ini").as_deref(), Some(PLUGIN_INI));
+    assert!(plan_repair(&c).unwrap().is_empty());
+
+    run(&c, plan_uninstall(&c, Some("enstash")));
+    clean(&dir);
+    user_files_kept(&pkg);
+    for n in ["dinput8.dll", "native-plugin.ini", "enstash-data.dat", "licenses"] {
+        assert!(!pkg.join(n).exists(), "{n}");
+    }
+    std::fs::remove_dir_all(pkg).unwrap();
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn under_shroudforge_a_hand_install_is_updated_and_given_back() {
+    let dir = game("shroudforge-hand");
+    let sf = shroudforge(&dir);
+    // installed by hand from the zip, with mod.json (which keeps the folder switched off) and an older data file
+    let pkg = dir.join("mods\\enstash");
+    enstash_user_files(&pkg);
+    std::fs::write(pkg.join("dinput8.dll"), fake_dll(&["enstash Quick Stack", "0.11"], None)).unwrap();
+    std::fs::write(pkg.join("mod.json"), b"{\"id\":\"enstash\"}").unwrap();
+    std::fs::write(pkg.join("native-plugin.ini"), PLUGIN_INI).unwrap();
+    std::fs::write(pkg.join("enstash-data.txt"), b"old data").unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+
+    let p = install(&c, &enstash_zip(enstash(), b"dat"));
+    // the copy there is the same mod's: no leave to replace is needed, and dllchain keeps it
+    assert!(p.replaces.is_empty(), "{:?}", p.replaces);
+    assert!(p.summary.iter().any(|l| l.starts_with("Takes out mods\\enstash\\mod.json")), "{:?}", p.summary);
+    assert!(p.summary.iter().any(|l| l.starts_with("Takes out mods\\enstash\\enstash-data.txt")), "{:?}", p.summary);
+    assert_eq!(read(&pkg, "dinput8.dll"), Some(enstash()));
+    assert!(!pkg.join("mod.json").exists());
+    assert!(!pkg.join("enstash-data.txt").exists());
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf));
+    user_files_kept(&pkg);
+
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn a_mod_chained_with_shroudforge_moves_into_its_folder() {
+    // ShroudForge put in after enstash, as dllchain 0.1.5 let it: enstash chained next to the game, where
+    // ShroudForge never loads it
+    let dir = game("shroudforge-legacy");
+    let host_enstash = fake_dll(&["enstash Quick Stack", "dinput8-chain.ini"], None);
+    let sf = fake_dll(&["shroudforge", "EML_LOG_FILE_PATH"], None);
+    let c = ctx(&dir);
+    install(&c, &enstash_zip(host_enstash.clone(), b"dat"));
+    install(&c, &src("ShroudForge.dll", sf.clone(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf.clone()));
+    assert_eq!(read(&dir, "enstash.dll"), Some(host_enstash.clone()));
+    let st = status(&c).unwrap();
+    assert!(st.notes.iter().any(|n| n.starts_with("enstash does not run: ShroudForge")), "{:?}", st.notes);
+
+    let p = install(&c, &enstash_zip(host_enstash.clone(), b"dat"));
+    assert!(p.summary.iter().any(|l| l.starts_with("enstash moves from the game folder into mods\\enstash\\")));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf));
+    assert_eq!(read(&dir, "mods\\enstash\\dinput8.dll"), Some(host_enstash));
+    assert_eq!(read(&dir, "dinput8-chain.ini"), None);
+    for n in ["shroudforge.dll", "enstash.dll", "mod.json", "native-plugin.ini", "enstash-data.dat", "licenses"] {
+        assert!(!dir.join(n).exists(), "{n}");
+    }
+    let st = status(&c).unwrap();
+    assert!(st.notes.iter().all(|n| !n.contains("does not run")), "{:?}", st.notes);
+    assert!(st.repair.is_empty(), "{:?}", st.repair);
+}
+
+#[test]
+fn under_shroudforge_a_mod_that_does_not_say_how_to_load_it_is_refused() {
+    let dir = game("shroudforge-refuse");
+    shroudforge(&dir);
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let e = plan_install(&c, &src("AutoLootPlus.zip", alp(), &[("mods\\alp\\config.txt", b"cfg")])).unwrap_err();
+    assert!(e.0.contains("native-plugin.ini"), "{}", e.0);
+    let e = plan_install(&c, &src("enstash.dll", enstash(), &[])).unwrap_err();
+    assert!(e.0.contains("native-plugin.ini"), "{}", e.0);
+    // a declaration that loads another DLL, or is switched off
+    let other = src(ENSTASH_ZIP, enstash(), &[("native-plugin.ini", b"[Plugin]\r\nEnabled=1\r\nDll=other.dll\r\n")]);
+    assert!(plan_install(&c, &other).unwrap_err().0.contains("loads other.dll"));
+    let off = src(ENSTASH_ZIP, enstash(), &[("native-plugin.ini", b"[Plugin]\r\nEnabled=0\r\nDll=dinput8.dll\r\n")]);
+    assert!(plan_install(&c, &off).unwrap_err().0.contains("Enabled=0"));
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn shroudforge_with_another_loaders_eml_is_refused() {
+    let dir = game("shroudforge-eml");
+    shroudforge(&dir);
+    // EML's own dbghelp.dll copied over ShroudForge's
+    std::fs::write(dir.join("dbghelp.dll"), fake_dll(&["EML_LOG_FILE_PATH"], None)).unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let e = plan_install(&c, &enstash_zip(enstash(), b"dat")).unwrap_err();
+    assert!(e.0.contains("dbghelp.dll is EML, not ShroudForge's own"), "{}", e.0);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn next_to_eml_enstash_chains_with_auto_loot_plus() {
+    let dir = game("eml-enstash");
+    std::fs::write(dir.join("dbghelp.dll"), fake_dll(&["EML_LOG_FILE_PATH"], None)).unwrap();
+    std::fs::create_dir_all(dir.join("mods\\other")).unwrap();
+    std::fs::write(dir.join("mods\\other\\mod.json"), b"{}").unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let p = install(&c, &src("AutoLootPlus.zip", alp(), &[(r"mods\auto-loot-plus\mod.json", b"{}")]));
+    assert!(p.missing.is_empty());
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash()));
+    assert!(!dir.join("mods\\enstash").exists());
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+}
+
+/// Sets a file's last-write time `secs` from now.
+fn touch(path: &Path, secs: i64) {
+    let now = std::time::SystemTime::now();
+    let d = std::time::Duration::from_secs(secs.unsigned_abs());
+    let t = if secs >= 0 { now + d } else { now - d };
+    std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+}
+
+#[test]
+fn status_says_whether_enstash_loaded_at_the_last_start() {
+    let dir = game("load-check");
+    shroudforge(&dir);
+    let c = ctx(&dir);
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    let pkg = dir.join("mods\\enstash");
+    let load = || row(&status(&c).unwrap(), "enstash").load.clone().unwrap();
+
+    assert_eq!(load().0, Load::NotYet);
+    // the game started, and enstash wrote nothing
+    std::fs::write(dir.join("enshrouded.log"), b"game").unwrap();
+    touch(&dir.join("enshrouded.log"), 60);
+    assert_eq!(load().0, Load::NotLoaded);
+    // a log from before the install says nothing about this one
+    std::fs::write(pkg.join("enstash-quickstack.log"), b"05:55:27 enstash Quick Stack placeholders 0.12.2\r\n")
+        .unwrap();
+    touch(&pkg.join("enstash-quickstack.log"), -3600);
+    assert_eq!(load().0, Load::NotLoaded);
+
+    let log = |text: &str| {
+        std::fs::write(pkg.join("enstash-quickstack.log"), text).unwrap();
+        touch(&pkg.join("enstash-quickstack.log"), 60);
+        load()
+    };
+    let ok = log("05:55:27 enstash Quick Stack placeholders 0.12.2\r\n05:55:30 hooked\r\n05:55:31 placeholders ON\r\n");
+    assert_eq!(ok, (Load::Loaded, "loaded at the game's last start (0.12.2)".to_string()));
+    let off = log(
+        "05:55:27 enstash Quick Stack placeholders 0.12.2\r\n05:55:31 placeholders OFF (enstash-quickstack.off)\r\n",
+    );
+    assert_eq!(off.0, Load::Off);
+    let older = log("05:55:27 enstash Quick Stack placeholders 0.11.0\r\n05:55:31 placeholders ON\r\n");
+    assert_eq!(older.0, Load::NotLoaded);
+    assert!(older.1.contains("says 0.11.0, not 0.12.2-beta"), "{}", older.1);
+    let stuck = log("05:55:27 enstash Quick Stack placeholders 0.12.2\r\n");
+    assert_eq!(stuck.0, Load::NotLoaded);
+    let st = status(&c).unwrap();
+    assert!(row(&st, "enstash").details.iter().any(|(k, v)| k == "Last start" && v.contains("did not finish")));
+}
+
+#[test]
+fn undo_takes_back_the_last_change_and_undo_again_makes_it_again() {
+    let dir = game("undo");
+    let c = ctx(&dir);
+    assert!(plan_undo(&c).unwrap_err().0.contains("no change to undo"));
+    let empty = without_own(&snapshot(&dir));
+
+    install(&c, &src("AutoLootPlus.zip", alp(), &[("mods\\alp\\config.txt", b"cfg")]));
+    let one = snapshot(&dir);
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    let two = snapshot(&dir);
+    let record = |s: &BTreeMap<String, Vec<u8>>| s.get("dllchain\\record.txt").cloned();
+    assert_eq!(status(&c).unwrap().undo.unwrap().0, format!("install {ENSTASH_ZIP}"));
+
+    let p = run(&c, plan_undo(&c));
+    assert!(
+        p.summary[0].starts_with(&format!("Takes back the last change: install {ENSTASH_ZIP} (")),
+        "{:?}",
+        p.summary
+    );
+    clean(&dir);
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&one));
+    assert_eq!(record(&snapshot(&dir)), record(&one));
+    assert!(status(&c).unwrap().repair.is_empty());
+
+    // undo again: the change is made again
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&two));
+    assert_eq!(record(&snapshot(&dir)), record(&two));
+
+    // a file the change made, changed since: undo would lose it, so it is refused and nothing changes
+    std::fs::write(dir.join("enstash-data.dat"), b"edited").unwrap();
+    let now = snapshot(&dir);
+    let e = plan_undo(&c).unwrap_err();
+    assert!(e.0.contains("enstash-data.dat changed after the last change"), "{}", e.0);
+    assert_eq!(snapshot(&dir), now);
+
+    // undoing the very first install leaves the game as it was
+    let dir = game("undo-first");
+    let c = ctx(&dir);
+    install(&c, &src("AutoLootPlus.zip", alp(), &[("mods\\alp\\config.txt", b"cfg")]));
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), empty);
+    assert!(status(&c).unwrap().rows.is_empty());
+}
+
+#[test]
+fn a_version_in_a_file_name() {
+    assert_eq!(version_in(ENSTASH_ZIP).as_deref(), Some("0.12.2-beta"));
+    assert_eq!(version_in("C:\\x\\enstash-v0.12.2.zip").as_deref(), Some("0.12.2"));
+    assert_eq!(version_in("Mod 1.4.zip").as_deref(), Some("1.4"));
+    assert_eq!(version_in("AutoLootPlus-1-1-8.zip"), None);
+    assert_eq!(version_in("x64mod.zip"), None);
+    assert_eq!(version_in("mod.zip"), None);
 }

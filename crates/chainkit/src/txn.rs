@@ -13,6 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const JOURNAL: &str = "dllchain\\journal.txt";
+/// The journal of the last run that finished, kept with its copies so the run can be undone.
+pub const UNDO: &str = "dllchain\\undo.txt";
 const HEADER: &str = "dllchain-journal\t1";
 const TMP: &str = ".dllchain-tmp";
 
@@ -28,6 +30,9 @@ struct Touched {
 pub struct Txn {
     game: PathBuf,
     id: String,
+    /// What the run is, in words ("install x.zip"), and when it began.
+    action: String,
+    at: String,
     touched: Vec<Touched>,
     made_dirs: Vec<RelPath>,
     removed_dirs: Vec<RelPath>,
@@ -36,13 +41,15 @@ pub struct Txn {
 }
 
 impl Txn {
-    pub fn begin(game: &Path, id: &str) -> Result<Txn> {
+    pub fn begin(game: &Path, id: &str, action: &str) -> Result<Txn> {
         if resolve(game, &RelPath::of(JOURNAL))?.exists() {
             fail!("an earlier dllchain run was not finished; it must be undone first");
         }
         let t = Txn {
             game: game.to_path_buf(),
             id: id.to_string(),
+            action: one_line(action),
+            at: crate::clock::now_text(),
             touched: Vec::new(),
             made_dirs: Vec::new(),
             removed_dirs: Vec::new(),
@@ -62,7 +69,7 @@ impl Txn {
     }
 
     fn persist(&self) -> Result<()> {
-        let mut lines = vec![format!("{HEADER}\t{}", self.id)];
+        let mut lines = vec![format!("{HEADER}\t{}", self.id), format!("action\t{}\t{}", self.at, self.action)];
         for t in &self.touched {
             let b = t.before.as_ref().map_or("-\t-".to_string(), |(b, s)| format!("{b}\t{s}"));
             lines.push(format!("touch\t{}\t{b}", t.rel));
@@ -181,21 +188,20 @@ impl Txn {
         Ok(true)
     }
 
+    /// Ends the run. Its journal and copies are kept as the one run that can be undone; the run before loses its.
     pub fn commit(self) -> Result<Vec<String>> {
-        // the journal goes first: without it the copies are never needed again
-        std::fs::remove_file(self.path(&RelPath::of(JOURNAL))?)?;
-        self.drop_backups();
+        let undo = self.path(&RelPath::of(UNDO))?;
+        let older = std::fs::read_to_string(&undo).ok().and_then(|t| journal_id(&t)).filter(|id| *id != self.id);
+        // the journal stops being one first (a rename replaces the old undo file in one step)
+        std::fs::rename(self.path(&RelPath::of(JOURNAL))?, &undo)?;
+        if let Some(id) = older {
+            drop_backups(&self.game, &id);
+        }
         Ok(self.log)
     }
 
-    /// Removes this run's copies (and the backup folder when no other run's copies are in it).
     fn drop_backups(&self) {
-        if let Ok(p) = self.path(&self.backup_dir()) {
-            let _ = std::fs::remove_dir_all(&p);
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::remove_dir(parent); // only when empty
-            }
-        }
+        drop_backups(&self.game, &self.id);
     }
 
     /// Puts every touched file back as it was. Returns a line for each file it had to leave alone.
@@ -258,21 +264,83 @@ pub fn recover(game: &Path) -> Result<Option<Vec<String>>> {
     let Ok(text) = std::fs::read_to_string(&jp) else {
         return Ok(None);
     };
-    let mut lines = text.lines();
-    let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
-    let id = match head.as_slice() {
-        ["dllchain-journal", "1", id] if crate::paths::is_word(id) => id.to_string(),
-        _ => {
-            std::fs::remove_file(&jp)?;
-            return Ok(Some(vec![
-                "dllchain's journal of an unfinished run could not be read; it was removed and nothing was undone"
-                    .into(),
-            ]));
-        }
+    let Some((t, notes)) = parse(game, &text) else {
+        std::fs::remove_file(&jp)?;
+        return Ok(Some(vec![
+            "dllchain's journal of an unfinished run could not be read; it was removed and nothing was undone".into(),
+        ]));
     };
+    let mut out = vec!["An earlier dllchain run was cut off; its changes were undone.".to_string()];
+    out.extend(notes);
+    out.extend(t.rollback());
+    Ok(Some(out))
+}
+
+/// One file the last finished run changed.
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub rel: RelPath,
+    /// The copy of what was there and its SHA-256 (`None`: nothing was).
+    pub before: Option<(RelPath, String)>,
+    /// What the run left there (`None`: nothing).
+    pub after: Option<String>,
+}
+
+/// The last run that finished, which can be undone.
+#[derive(Clone, Debug)]
+pub struct LastRun {
+    pub action: String,
+    /// When it ran (local time, as [`crate::clock::now_text`] writes it).
+    pub at: String,
+    pub changes: Vec<Change>,
+    /// Folders it created, deepest last.
+    pub made_dirs: Vec<RelPath>,
+    /// Journal lines that could not be read; a run with any cannot be undone.
+    pub unreadable: Vec<String>,
+}
+
+/// The last finished run, from `dllchain\undo.txt`; `None` when there is none (or it cannot be read).
+pub fn last_run(game: &Path) -> Result<Option<LastRun>> {
+    let Ok(text) = std::fs::read_to_string(resolve(game, &RelPath::of(UNDO))?) else {
+        return Ok(None);
+    };
+    let Some((t, unreadable)) = parse(game, &text) else { return Ok(None) };
+    let changes = t
+        .touched
+        .iter()
+        .map(|x| Change { rel: x.rel.clone(), before: x.before.clone(), after: x.intended.last().cloned().flatten() })
+        .collect();
+    Ok(Some(LastRun { action: t.action, at: t.at, changes, made_dirs: t.made_dirs, unreadable }))
+}
+
+/// The id in a journal's first line.
+fn journal_id(text: &str) -> Option<String> {
+    let head: Vec<&str> = text.lines().next()?.split('\t').collect();
+    match head.as_slice() {
+        ["dllchain-journal", "1", id] if crate::paths::is_word(id) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+/// Removes a run's copies (and the backup folder when no other run's copies are in it).
+fn drop_backups(game: &Path, id: &str) {
+    let Ok(rel) = RelPath::parse(&format!("{OWN_DIR}\\backup\\{id}")) else { return };
+    if let Ok(p) = resolve(game, &rel) {
+        let _ = std::fs::remove_dir_all(&p);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::remove_dir(parent); // only when empty
+        }
+    }
+}
+
+/// A journal as a run to roll back, with a note for each line it skipped; `None` when its first line is not one.
+fn parse(game: &Path, text: &str) -> Option<(Txn, Vec<String>)> {
+    let id = journal_id(text)?;
     let mut t = Txn {
         game: game.to_path_buf(),
         id,
+        action: String::new(),
+        at: String::new(),
         touched: Vec::new(),
         made_dirs: Vec::new(),
         removed_dirs: Vec::new(),
@@ -280,7 +348,7 @@ pub fn recover(game: &Path) -> Result<Option<Vec<String>>> {
     };
     let backups = t.backup_dir();
     let mut notes = Vec::new();
-    for line in lines {
+    for line in text.lines().skip(1) {
         let f: Vec<&str> = line.split('\t').collect();
         let ok = match f.as_slice() {
             ["touch", rel, b, s] => match RelPath::parse(rel) {
@@ -314,6 +382,10 @@ pub fn recover(game: &Path) -> Result<Option<Vec<String>>> {
             }
             ["made-dir", d] => RelPath::parse(d).map(|d| t.made_dirs.push(d)).is_ok(),
             ["removed-dir", d] => RelPath::parse(d).map(|d| t.removed_dirs.push(d)).is_ok(),
+            ["action", at, action] => {
+                (t.at, t.action) = (at.to_string(), action.to_string());
+                true
+            }
             [""] => true,
             _ => false,
         };
@@ -321,10 +393,12 @@ pub fn recover(game: &Path) -> Result<Option<Vec<String>>> {
             notes.push(format!("journal line skipped: {line}"));
         }
     }
-    let mut out = vec!["An earlier dllchain run was cut off; its changes were undone.".to_string()];
-    out.extend(notes);
-    out.extend(t.rollback());
-    Ok(Some(out))
+    Some((t, notes))
+}
+
+/// Text for one journal field: no tabs or line breaks.
+fn one_line(s: &str) -> String {
+    s.chars().map(|c| if c == '\t' || c == '\r' || c == '\n' { ' ' } else { c }).collect()
 }
 
 fn tmp_path(p: &Path) -> PathBuf {
@@ -366,7 +440,7 @@ mod tests {
         let g = dir("rollback");
         std::fs::write(g.join("a.txt"), b"old a").unwrap();
         std::fs::write(g.join("b.dll"), b"bbb").unwrap();
-        let mut t = Txn::begin(&g, "t1").unwrap();
+        let mut t = Txn::begin(&g, "t1", "test").unwrap();
         t.write(&RelPath::of("a.txt"), b"new a").unwrap();
         t.write(&RelPath::of("new\\deep\\c.txt"), b"c").unwrap();
         t.rename(&RelPath::of("b.dll"), &RelPath::of("moved.dll")).unwrap();
@@ -386,7 +460,7 @@ mod tests {
     fn a_cut_off_run_is_undone_and_others_changes_are_kept() {
         let g = dir("recover");
         std::fs::write(g.join("a.txt"), b"old").unwrap();
-        let mut t = Txn::begin(&g, "t2").unwrap();
+        let mut t = Txn::begin(&g, "t2", "test").unwrap();
         t.write(&RelPath::of("a.txt"), b"mine").unwrap();
         t.write(&RelPath::of("b.txt"), b"mine too").unwrap();
         std::mem::forget(t); // as if the process stopped here

@@ -20,6 +20,8 @@ pub struct DllInfo {
     /// Its file-name word and where it came from, when the DLL says who it is.
     pub word: Option<(String, WordFrom)>,
     pub product_name: Option<String>,
+    /// Its version, from its version information (`ProductVersion`, else `FileVersion`).
+    pub version: Option<String>,
     /// It reads the chain file, so it can start the others when it is the host.
     pub can_host: bool,
     /// EMF's own loader.
@@ -49,6 +51,7 @@ pub fn inspect(bytes: &[u8], game: &Game) -> Result<DllInfo> {
         size: bytes.len() as u64,
         word,
         product_name,
+        version: version_string(bytes, "ProductVersion").or_else(|| version_string(bytes, "FileVersion")),
         can_host: is_emf || game.host_texts.iter().any(|t| contains_text(bytes, t)),
         is_emf,
     })
@@ -126,6 +129,12 @@ fn version_string(b: &[u8], key: &str) -> Option<String> {
 /// Bytes that pass [`inspect`]'s DLL check, holding `texts` (ASCII) and an optional product name. For tests here and
 /// in the crates that use chainkit; nothing in it can run.
 pub fn fake_dll(texts: &[&str], product_name: Option<&str>) -> Vec<u8> {
+    let info: Vec<(&str, &str)> = product_name.map(|n| ("ProductName", n)).into_iter().collect();
+    fake_dll_with(texts, &info)
+}
+
+/// [`fake_dll`] with any version information strings: (key, value).
+pub fn fake_dll_with(texts: &[&str], info: &[(&str, &str)]) -> Vec<u8> {
     let mut b = vec![0u8; 0x80];
     b[0] = b'M';
     b[1] = b'Z';
@@ -137,12 +146,12 @@ pub fn fake_dll(texts: &[&str], product_name: Option<&str>) -> Vec<u8> {
         b.extend_from_slice(t.as_bytes());
         b.push(0);
     }
-    if let Some(name) = product_name {
+    for (k, v) in info {
         while b.len() % 4 != 0 {
             b.push(0);
         }
-        let key: Vec<u8> = "ProductName\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let value: Vec<u8> = format!("{name}\0").encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let key: Vec<u8> = format!("{k}\0").encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let value: Vec<u8> = format!("{v}\0").encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         let mut s = Vec::new();
         s.extend_from_slice(&0u16.to_le_bytes()); // wLength, not read
         s.extend_from_slice(&((value.len() / 2) as u16).to_le_bytes());
@@ -181,6 +190,14 @@ mod tests {
 
         let ms = inspect(&fake_dll(&[], Some("Microsoft Windows Operating System")), &ENSHROUDED).unwrap();
         assert_eq!(ms.word, None);
+    }
+
+    #[test]
+    fn version_from_version_info() {
+        let v = |info: &[(&str, &str)]| inspect(&fake_dll_with(&[], info), &ENSHROUDED).unwrap().version;
+        assert_eq!(v(&[("ProductVersion", "0.12.2"), ("FileVersion", "0.12.2.0")]).as_deref(), Some("0.12.2"));
+        assert_eq!(v(&[("FileVersion", "1.1.8.0")]).as_deref(), Some("1.1.8.0"));
+        assert_eq!(v(&[]), None);
     }
 
     #[test]
