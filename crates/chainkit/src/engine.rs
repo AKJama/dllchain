@@ -54,6 +54,11 @@ impl Ctx {
         resolve(&self.dir, rel).map(|p| p.exists()).unwrap_or(true)
     }
 
+    /// A copy dllchain kept, only when it is still the one it kept.
+    fn read_checked(&self, rel: &RelPath, sha: &str) -> Option<Vec<u8>> {
+        self.read(rel).filter(|b| sha256_hex(b) == sha)
+    }
+
     fn modified(&self, rel: &RelPath) -> Option<std::time::SystemTime> {
         resolve(&self.dir, rel).ok().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok())
     }
@@ -315,7 +320,7 @@ fn locate(ctx: &Ctx, scan: &Scan, m: &ModRec) -> Option<RelPath> {
 
 /// A mod's DLL: dllchain's copy, else the file where it is.
 fn load_dll(ctx: &Ctx, scan: &Scan, m: &ModRec) -> Option<Vec<u8>> {
-    let stored = ctx.read(&store_rel(&m.word, &m.dll_sha)).filter(|b| sha256_hex(b) == m.dll_sha);
+    let stored = ctx.read_checked(&store_rel(&m.word, &m.dll_sha), &m.dll_sha);
     stored.or_else(|| locate(ctx, scan, m).and_then(|r| ctx.read(&r)))
 }
 
@@ -922,7 +927,7 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
 
     let before = w.plan.summary.len();
     retire(&mut w, &mut rec, None, &src.files, None)?;
-    plan_files(&mut w, &mut rec, &src.files, &src.label, src.files.is_empty(), &|_| false)?;
+    plan_files(&mut w, &mut rec, &src.files, &src.label, src.files.is_empty(), &|_| false, NOT_IN_NEW)?;
     if let Some(i) = prev {
         w.mods[i] = rec;
     } else {
@@ -969,8 +974,7 @@ pub fn version_in(label: &str) -> Option<String> {
     let starts = (0..b.len())
         .filter(|&i| b[i].is_ascii_digit() && (i == 0 || !b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'v'));
     for i in starts {
-        let end = (i..b.len()).find(|&j| !(b[j].is_ascii_digit() || b[j] == b'.')).unwrap_or(b.len());
-        let num = stem[i..end].trim_end_matches('.');
+        let num = version_numbers(&stem[i..]);
         if !num.contains('.') {
             continue;
         }
@@ -1140,13 +1144,8 @@ fn plan_install_package(
         }
     }
     retire(&mut w, &mut rec, Some(&dir), &files, Some((&dir.join(ph.off_switch)?, &host)))?;
-    plan_files(&mut w, &mut rec, &files, &src.label, dll_only, &|r| r.strip_prefix(&dir).is_some())?;
-    if chained.is_some() {
-        for l in w.plan.summary.iter_mut().filter(|l| l.starts_with("Deletes ")) {
-            *l = l.replace(", which the new version does not have", ", which it had next to the game");
-            *l = l.replace(" the new version does not have", " it had next to the game");
-        }
-    }
+    let gone = if chained.is_some() { "it had next to the game" } else { NOT_IN_NEW };
+    plan_files(&mut w, &mut rec, &files, &src.label, dll_only, &|r| r.strip_prefix(&dir).is_some(), gone)?;
     w.packages.push(rec);
     w.layout()?;
     w.forget_lone_host();
@@ -1238,9 +1237,13 @@ fn retire(
     Ok(())
 }
 
+/// Why an update deletes the files of the earlier version that the new one does not ship.
+const NOT_IN_NEW: &str = "the new version does not have";
+
 /// The mod's other files: created, updated, kept when the player changed them, and the old version's leftovers.
 /// `earlier(rel)`: a file there now that dllchain did not install is the same mod's, from a copy put in by hand (it is
-/// kept and put back on uninstall like any file replaced, but asks for no leave to replace).
+/// kept and put back on uninstall like any file replaced, but asks for no leave to replace). `gone` says why the earlier
+/// install's files that are not in `src_files` are deleted ("the new version does not have").
 fn plan_files(
     w: &mut Work,
     rec: &mut ModRec,
@@ -1248,6 +1251,7 @@ fn plan_files(
     label: &str,
     dll_only: bool,
     earlier: &dyn Fn(&RelPath) -> bool,
+    gone: &str,
 ) -> Result<()> {
     let ctx = w.ctx;
     let prev_files = rec.files.clone();
@@ -1381,8 +1385,8 @@ fn plan_files(
     let deleted: Vec<&RelPath> = undone.deleted.iter().collect();
     match deleted.len() {
         0 => {}
-        1 => w.plan.summary.push(format!("Deletes {}, which the new version does not have.", deleted[0])),
-        k => w.plan.summary.push(format!("Deletes {k} files the new version does not have{}.", most_in(&deleted))),
+        1 => w.plan.summary.push(format!("Deletes {}, which {gone}.", deleted[0])),
+        k => w.plan.summary.push(format!("Deletes {k} files {gone}{}.", most_in(&deleted))),
     }
     undone.words(w);
     rec.files = files;
@@ -1607,7 +1611,7 @@ pub fn plan_undo(ctx: &Ctx) -> Result<Plan> {
         }
         match &c.before {
             Some((copy, sha)) => {
-                let Some(bytes) = ctx.read(copy).filter(|b| sha256_hex(b) == *sha) else {
+                let Some(bytes) = ctx.read_checked(copy, sha) else {
                     fail!("dllchain's copy of {} from before the last change is gone, so it cannot be undone", c.rel);
                 };
                 if c.after.as_deref() == Some(sha.as_str()) {
@@ -1736,7 +1740,7 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
         }
         if let Some(r) = &m.replaced_dll {
             // the copy that was there before this install comes back
-            let bytes = ctx.read(&store_rel(t, r)).filter(|b| sha256_hex(b) == *r);
+            let bytes = ctx.read_checked(&store_rel(t, r), r);
             match bytes {
                 Some(b) => {
                     w.plan.summary.push(format!("Your earlier copy of {display} is put back."));
@@ -1777,7 +1781,7 @@ fn put_back_retired(w: &mut Work, m: &ModRec) {
     let ctx = w.ctx;
     for f in &m.retired {
         let Some(backup) = &f.backup else { continue };
-        let Some(bytes) = ctx.read(backup).filter(|b| sha256_hex(b) == f.sha) else {
+        let Some(bytes) = ctx.read_checked(backup, &f.sha) else {
             w.plan.notes.push(format!("dllchain's copy of {} is gone, so it cannot be put back", f.rel));
             continue;
         };
@@ -1990,8 +1994,8 @@ fn version_numbers(v: &str) -> &str {
 /// its log at every start, so a game log newer than the DLL with no newer mod log means it did not load.
 pub fn load_check(ctx: &Ctx, word: &str, dll: &RelPath, version: Option<&str>) -> Option<(Load, String)> {
     let log = ctx.game.tool(word)?.log.as_ref()?;
-    let log_rel = match dll.as_str().rsplit_once('\\') {
-        Some((dir, _)) => RelPath::parse(&format!("{dir}\\{}", log.file)).ok()?,
+    let log_rel = match dll.parent() {
+        Some(dir) => dir.join(log.file).ok()?,
         None => RelPath::of(log.file),
     };
     let installed = ctx.modified(dll)?;
@@ -2125,9 +2129,13 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             if m.word != name {
                 details.push(pair("Short name", m.word.clone()));
             }
-            let dll_version = ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok()).and_then(|i| i.version);
+            // only the DLL's own version says which copy should have run; one from a zip's name is a guess. It is read
+            // only when needed: for a mod with a known log, or one with no version on record
+            let has_log = ctx.game.tool(&m.word).is_some_and(|t| t.log.is_some());
+            let dll_version = (has_log || m.version.is_none())
+                .then(|| ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok()).and_then(|i| i.version))
+                .flatten();
             let version = m.version.clone().or_else(|| dll_version.clone());
-            // only the DLL's own version says which copy should have run; one from a zip's name is a guess
             let load = load_check(ctx, &m.word, rel, dll_version.as_deref());
             if let Some(v) = &version {
                 details.insert(1, pair("Version", v.clone()));

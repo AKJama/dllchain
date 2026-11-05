@@ -72,7 +72,8 @@ pub fn store_rel(word: &str, sha: &str) -> RelPath {
     RelPath::of(&format!("{OWN_DIR}\\mods\\{word}\\{sha}.dll"))
 }
 
-fn clean(s: &str) -> String {
+/// Text for one field of a tab-separated line: no tabs or line breaks.
+pub(crate) fn clean(s: &str) -> String {
     s.chars().map(|c| if c == '\t' || c == '\r' || c == '\n' { ' ' } else { c }).collect()
 }
 

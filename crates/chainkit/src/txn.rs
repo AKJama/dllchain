@@ -48,7 +48,7 @@ impl Txn {
         let t = Txn {
             game: game.to_path_buf(),
             id: id.to_string(),
-            action: one_line(action),
+            action: crate::record::clean(action),
             at: crate::clock::now_text(),
             touched: Vec::new(),
             made_dirs: Vec::new(),
@@ -61,7 +61,7 @@ impl Txn {
     }
 
     pub fn backup_dir(&self) -> RelPath {
-        RelPath::of(&format!("{OWN_DIR}\\backup\\{}", self.id))
+        backup_dir(&self.id)
     }
 
     fn path(&self, rel: &RelPath) -> Result<PathBuf> {
@@ -200,10 +200,6 @@ impl Txn {
         Ok(self.log)
     }
 
-    fn drop_backups(&self) {
-        drop_backups(&self.game, &self.id);
-    }
-
     /// Puts every touched file back as it was. Returns a line for each file it had to leave alone.
     pub fn rollback(self) -> Vec<String> {
         let mut notes = Vec::new();
@@ -252,7 +248,7 @@ impl Txn {
         }
         // a file that could not be put back keeps its copy
         if notes.iter().all(|n| !n.contains("could not be put back")) {
-            self.drop_backups();
+            drop_backups(&self.game, &self.id);
         }
         notes
     }
@@ -287,7 +283,7 @@ pub struct Change {
 }
 
 /// The last run that finished, which can be undone.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LastRun {
     pub action: String,
     /// When it ran (local time, as [`crate::clock::now_text`] writes it).
@@ -307,8 +303,7 @@ pub fn last_run(game: &Path) -> Result<Option<LastRun>> {
     let Some((t, unreadable)) = parse(game, &text) else {
         // there is one, but it cannot be read: say so rather than that there is none
         let first = text.lines().next().unwrap_or("").to_string();
-        let (action, at) = (String::new(), String::new());
-        return Ok(Some(LastRun { action, at, changes: Vec::new(), made_dirs: Vec::new(), unreadable: vec![first] }));
+        return Ok(Some(LastRun { unreadable: vec![first], ..LastRun::default() }));
     };
     let changes = t
         .touched
@@ -316,6 +311,11 @@ pub fn last_run(game: &Path) -> Result<Option<LastRun>> {
         .map(|x| Change { rel: x.rel.clone(), before: x.before.clone(), after: x.intended.last().cloned().flatten() })
         .collect();
     Ok(Some(LastRun { action: t.action, at: t.at, changes, made_dirs: t.made_dirs, unreadable }))
+}
+
+/// Where a run keeps its copies of what it changed.
+fn backup_dir(id: &str) -> RelPath {
+    RelPath::of(&format!("{OWN_DIR}\\backup\\{id}"))
 }
 
 /// The id in a journal's first line.
@@ -329,8 +329,7 @@ fn journal_id(text: &str) -> Option<String> {
 
 /// Removes a run's copies (and the backup folder when no other run's copies are in it).
 fn drop_backups(game: &Path, id: &str) {
-    let Ok(rel) = RelPath::parse(&format!("{OWN_DIR}\\backup\\{id}")) else { return };
-    if let Ok(p) = resolve(game, &rel) {
+    if let Ok(p) = resolve(game, &backup_dir(id)) {
         let _ = std::fs::remove_dir_all(&p);
         if let Some(parent) = p.parent() {
             let _ = std::fs::remove_dir(parent); // only when empty
@@ -399,11 +398,6 @@ fn parse(game: &Path, text: &str) -> Option<(Txn, Vec<String>)> {
         }
     }
     Some((t, notes))
-}
-
-/// Text for one journal field: no tabs or line breaks.
-fn one_line(s: &str) -> String {
-    s.chars().map(|c| if c == '\t' || c == '\r' || c == '\n' { ' ' } else { c }).collect()
 }
 
 fn tmp_path(p: &Path) -> PathBuf {
