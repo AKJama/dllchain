@@ -961,7 +961,9 @@ fn fill_source(rec: &mut ModRec, src: &ModSource, info: &DllInfo) {
 /// A version in a file name: `SmartQuickStack-0.12.2-beta-03c1cbd.zip` gives `0.12.2-beta`. Only numbers with dots
 /// count (Nexus names keep the mod's number and dashes, which say nothing certain).
 pub fn version_in(label: &str) -> Option<String> {
-    let name = label.rsplit(['\\', '/']).next().unwrap_or(label);
+    // a folder's label ends with a backslash
+    let trimmed = label.trim_end_matches(['\\', '/']);
+    let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
     let stem = name.strip_suffix(".zip").or_else(|| name.strip_suffix(".dll")).unwrap_or(name);
     let b = stem.as_bytes();
     let starts = (0..b.len())
@@ -1074,6 +1076,23 @@ fn plan_install_package(
             ));
             if w.mods.iter().any(|m| m.word == ph.word && !m.dll_at.same(&ctx.host())) {
                 w.plan.summary.push(format!("{host} becomes {} again, as it needs to be.", ctx.game.host_dll));
+            }
+            // the player's own files of the mod (marks, settings, switches) stay where they are, untouched
+            let prefix = format!("{}-", old.word);
+            let mut mine: Vec<String> = std::fs::read_dir(&ctx.dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.to_ascii_lowercase().starts_with(&prefix))
+                .filter(|n| !old.files.iter().any(|f| f.rel.as_str().eq_ignore_ascii_case(n)))
+                .collect();
+            mine.sort();
+            if !mine.is_empty() {
+                w.plan.notes.push(format!(
+                    "Your own {name} files next to the game stay there, as dllchain never moves them: {}. {name} now reads its files from {dir}\\, so move them there yourself to keep using them.",
+                    mine.join(", ")
+                ));
             }
             if old.replaced_dll.is_some() {
                 w.plan.notes.push(format!(
@@ -1762,15 +1781,17 @@ fn put_back_retired(w: &mut Work, m: &ModRec) {
             w.plan.notes.push(format!("dllchain's copy of {} is gone, so it cannot be put back", f.rel));
             continue;
         };
+        // the copy goes either way: with the mod off the list, nothing would ever give it back or clear it
         if ctx.exists(&f.rel) {
-            w.plan
-                .notes
-                .push(format!("{} is there again, so dllchain leaves it and keeps the old one in {backup}", f.rel));
-            continue;
+            w.plan.notes.push(format!(
+                "{} is there again, so dllchain leaves it as it is and drops the older copy it kept",
+                f.rel
+            ));
+        } else {
+            w.plan.summary.push(format!("Puts back {}, which was there before.", f.rel));
+            w.plan.expect_files.push((f.rel.clone(), Some(f.sha.clone())));
+            w.plan.steps.push(Step::Write(f.rel.clone(), bytes));
         }
-        w.plan.summary.push(format!("Puts back {}, which was there before.", f.rel));
-        w.plan.expect_files.push((f.rel.clone(), Some(f.sha.clone())));
-        w.plan.steps.push(Step::Write(f.rel.clone(), bytes));
         w.plan.steps.push(Step::Delete(backup.clone()));
     }
 }
@@ -2104,9 +2125,10 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             if m.word != name {
                 details.push(pair("Short name", m.word.clone()));
             }
-            let dll_version = || ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok()).and_then(|i| i.version);
-            let version = m.version.clone().or_else(dll_version);
-            let load = load_check(ctx, &m.word, rel, version.as_deref());
+            let dll_version = ctx.read(rel).and_then(|b| inspect(&b, ctx.game).ok()).and_then(|i| i.version);
+            let version = m.version.clone().or_else(|| dll_version.clone());
+            // only the DLL's own version says which copy should have run; one from a zip's name is a guess
+            let load = load_check(ctx, &m.word, rel, dll_version.as_deref());
             if let Some(v) = &version {
                 details.insert(1, pair("Version", v.clone()));
             }
@@ -2222,7 +2244,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     for m in scan.record.mods.iter().filter(|m| is_package(m)) {
         st.rows.push(row(&m.dll_at, format!("loaded by {loader} from its own folder")));
     }
-    if let Ok(Some(run)) = crate::txn::last_run(&ctx.dir) {
+    if let Ok(Some(run)) = crate::txn::last_run(&ctx.dir).map(|r| r.filter(|r| r.unreadable.is_empty())) {
         st.undo = Some((short_action(&run.action).to_string(), clock::readable(&run.at)));
     }
     match plan_repair(ctx) {

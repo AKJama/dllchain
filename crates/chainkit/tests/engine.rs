@@ -2,7 +2,7 @@
 //! hostile record.
 
 use chainkit::chainini::ChainFile;
-use chainkit::dllinfo::fake_dll;
+use chainkit::dllinfo::{fake_dll, fake_dll_with};
 use chainkit::engine::{
     Ctx, Load, Plan, Row, Status, apply, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status,
     version_in,
@@ -1059,11 +1059,21 @@ fn a_mod_chained_with_shroudforge_moves_into_its_folder() {
     let st = status(&c).unwrap();
     assert!(st.notes.iter().any(|n| n.starts_with("enstash does not run: ShroudForge")), "{:?}", st.notes);
 
+    enstash_user_files(&dir);
     let p = install(&c, &enstash_zip(host_enstash.clone(), b"dat"));
+    assert!(
+        p.notes
+            .iter()
+            .any(|n| n.starts_with("Your own enstash files next to the game stay there")
+                && n.contains("enstash-marks.txt")),
+        "{:?}",
+        p.notes
+    );
     assert!(p.summary.iter().any(|l| l.starts_with("enstash moves from the game folder into mods\\enstash\\")));
     assert_eq!(read(&dir, "dinput8.dll"), Some(sf));
     assert_eq!(read(&dir, "mods\\enstash\\dinput8.dll"), Some(host_enstash));
     assert_eq!(read(&dir, "dinput8-chain.ini"), None);
+    user_files_kept(&dir);
     for n in ["shroudforge.dll", "enstash.dll", "mod.json", "native-plugin.ini", "enstash-data.dat", "licenses"] {
         assert!(!dir.join(n).exists(), "{n}");
     }
@@ -1135,7 +1145,8 @@ fn status_says_whether_enstash_loaded_at_the_last_start() {
     let dir = game("load-check");
     shroudforge(&dir);
     let c = ctx(&dir);
-    install(&c, &enstash_zip(enstash(), b"dat"));
+    // the DLL says which version it is; a version from the zip's name alone is never held against the log
+    install(&c, &enstash_zip(fake_dll_with(&["enstash Quick Stack"], &[("ProductVersion", "0.12.2")]), b"dat"));
     let pkg = dir.join("mods\\enstash");
     let load = || row(&status(&c).unwrap(), "enstash").load.clone().unwrap();
 
@@ -1163,7 +1174,7 @@ fn status_says_whether_enstash_loaded_at_the_last_start() {
     assert_eq!(off.0, Load::Off);
     let older = log("05:55:27 enstash Quick Stack placeholders 0.11.0\r\n05:55:31 placeholders ON\r\n");
     assert_eq!(older.0, Load::NotLoaded);
-    assert!(older.1.contains("says 0.11.0, not 0.12.2-beta"), "{}", older.1);
+    assert!(older.1.contains("says 0.11.0, not 0.12.2"), "{}", older.1);
     let stuck = log("05:55:27 enstash Quick Stack placeholders 0.12.2\r\n");
     assert_eq!(stuck.0, Load::NotLoaded);
     let st = status(&c).unwrap();
@@ -1221,6 +1232,7 @@ fn a_version_in_a_file_name() {
     assert_eq!(version_in(ENSTASH_ZIP).as_deref(), Some("0.12.2-beta"));
     assert_eq!(version_in("C:\\x\\enstash-v0.12.2.zip").as_deref(), Some("0.12.2"));
     assert_eq!(version_in("Mod 1.4.zip").as_deref(), Some("1.4"));
+    assert_eq!(version_in(r"C:\x\SmartQuickStack-0.12.2-beta\").as_deref(), Some("0.12.2-beta"));
     assert_eq!(version_in("AutoLootPlus-1-1-8.zip"), None);
     assert_eq!(version_in("x64mod.zip"), None);
     assert_eq!(version_in("mod.zip"), None);

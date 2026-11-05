@@ -304,7 +304,12 @@ pub fn last_run(game: &Path) -> Result<Option<LastRun>> {
     let Ok(text) = std::fs::read_to_string(resolve(game, &RelPath::of(UNDO))?) else {
         return Ok(None);
     };
-    let Some((t, unreadable)) = parse(game, &text) else { return Ok(None) };
+    let Some((t, unreadable)) = parse(game, &text) else {
+        // there is one, but it cannot be read: say so rather than that there is none
+        let first = text.lines().next().unwrap_or("").to_string();
+        let (action, at) = (String::new(), String::new());
+        return Ok(Some(LastRun { action, at, changes: Vec::new(), made_dirs: Vec::new(), unreadable: vec![first] }));
+    };
     let changes = t
         .touched
         .iter()
