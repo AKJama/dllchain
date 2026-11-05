@@ -40,6 +40,8 @@ Close the game and Steam first; dllchain changes nothing while either runs.
   When the mod is also a script package for the [Enshrouded Mod Loader (EML)](https://brabb3l.github.io/kfc-parser/eml/usage.html) (it ships `mods\<name>\mod.json`) and EML is not installed, dllchain says so, with a link to EML's page.
   It installs the mod anyway and never downloads EML itself.
 - **Uninstall** or **Uninstall all** take mods out again.
+  Uninstall all first asks whether you are sure, and lists every file it removes and the folder it is in; Cancel changes nothing.
+  It cannot be undone, as dllchain's own folder goes too.
 - **Undo** takes back the last change (an install, an update, an uninstall, a repair or a rename), from the copies dllchain kept of every file it changed.
   Press Undo again to make the change again.
   When a file was changed by hand after that change, Undo refuses rather than lose your edit.
@@ -76,9 +78,12 @@ Without `--yes` it only shows what it would do.
 - One mod that can start others becomes `dinput8.dll`; every other mod is renamed to `<name>.dll` and listed in `dinput8-chain.ini`.
 - When a mod loader that hosts every mod is installed, it stays `dinput8.dll` and every mod is chained behind it; dllchain never touches the loader's own files.
 - When ShroudForge is installed, it stays `dinput8.dll` and each mod goes into a folder of its own, `mods\<name>\`, where ShroudForge loads it; no chain is used.
-  The mod must ship a `native-plugin.ini` that says which DLL to load, as enstash does, or dllchain refuses it and changes nothing.
+  A mod that ships a `native-plugin.ini` (which says which DLL to load), as enstash does, goes into that folder whole.
   A `mod.json` from the zip is left out of that folder, as ShroudForge does not load a native mod from a folder that has one.
+  A mod made for the game folder, such as Auto Loot Plus, keeps its other files where its zip puts them; its DLL goes into a folder of its own (`mods\<name>-dll\` when the zip already uses `mods\<name>\`), and dllchain writes the `native-plugin.ini` there.
   A mod that an older dllchain chained next to ShroudForge, where it never ran, is moved into its folder when you install it again.
+  So is a mod that was there before dllchain: dllchain keeps its copy, and Uninstall puts it back.
+  ShroudForge next to another loader's `dbghelp.dll` (EML's own) is refused with an explanation, as the two cannot run together.
 - A file an older version of a mod left behind and the new version no longer reads (such as enstash's `enstash-data.txt` once `enstash-data.dat` is there) is taken out on install, kept in `dllchain\originals\`, and put back on uninstall.
   Your own files next to a mod (its marks, settings, `.off` switches, backups and logs) are never touched.
 - A `dinput8.dll` that was already there, put in by hand or by another tool, is left as it is until you install another mod; then it joins the chain, and uninstalling gives it back.

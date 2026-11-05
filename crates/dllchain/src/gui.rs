@@ -566,7 +566,9 @@ fn question(a: &Action, plan: &Plan) -> (&'static str, String) {
         (Action::Install(_), Some(n)) => ("Install", format!("Install {n}?")),
         (Action::Install(_), None) => ("Install", "Install this mod?".to_string()),
         (Action::Uninstall(Some(_)), Some(n)) => ("Uninstall", format!("Uninstall {n}?")),
-        (Action::Uninstall(_), _) => ("Uninstall", "Uninstall every mod dllchain installed?".to_string()),
+        (Action::Uninstall(_), _) => {
+            ("Yes", "Are you sure you want to uninstall every mod dllchain installed?".to_string())
+        }
         (Action::Undo, _) => ("Undo", "Take back the last change?".to_string()),
         _ => ("Repair", "Repair your mods?".to_string()),
     }
@@ -605,6 +607,11 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
     }
     if let Action::Install(_) = a {
         content.push_str("\nYou can take this back with Undo, or later with Uninstall.");
+    }
+    if let Action::Uninstall(None) = a {
+        // every file, and where it is: this one cannot be undone
+        content.push_str(&format!("\nThese files are removed:\n{}", plain(&common::removed_text(plan))));
+        content.push_str("\nUndo cannot take this back. Cancel changes nothing.");
     }
     let mut details = String::new();
     if !sha.is_empty() {

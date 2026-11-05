@@ -120,6 +120,30 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
     }
+
+    /// The files the run takes out of the game folder for good (dllchain's own folder aside), by the folder they are
+    /// in: `""` for the game folder itself, else `mods\x\`. A file the run puts back afterwards is not one of them.
+    pub fn removed_by_folder(&self) -> Vec<(String, Vec<String>)> {
+        let written = |r: &RelPath| self.steps.iter().any(|s| matches!(s, Step::Write(w, _) if w.same(r)));
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for s in &self.steps {
+            let Step::Delete(r) = s else { continue };
+            if r.first_part().eq_ignore_ascii_case(OWN_DIR) || written(r) {
+                continue;
+            }
+            let folder = r.parent().map_or(String::new(), |p| format!("{p}\\"));
+            let name = r.file_name().to_string();
+            match out.iter_mut().find(|(f, _)| f.eq_ignore_ascii_case(&folder)) {
+                Some((_, names)) => names.push(name),
+                None => out.push((folder, vec![name])),
+            }
+        }
+        out.sort();
+        for (_, names) in &mut out {
+            names.sort_by_key(|n| n.to_lowercase());
+        }
+        out
+    }
 }
 
 /// What is in the game folder now.
@@ -268,7 +292,7 @@ fn keep_safe(record: &mut Record, game: &Game, notes: &mut Vec<String>) {
             && at.extension() == ".dll"
             && !game.protected_names.contains(&name.as_str())
             && game.proxy_names.iter().all(|p| *p == host_stem || format!("{p}.dll") != name);
-        if !dll_ok && !game.package_hosts.iter().any(|h| at.same(&package_dll(game, h, &m.word))) {
+        if !dll_ok && !game.package_hosts.iter().any(|h| is_package_dll(game, h, &m.word, at)) {
             notes.push(format!("record: {} would have its DLL at {at}, which dllchain never uses; left out", m.word));
             return false;
         }
@@ -292,9 +316,20 @@ fn package_dir(host: &PackageHost, word: &str) -> RelPath {
     RelPath::of(&format!("{}\\{word}", host.dir))
 }
 
-/// The mod's DLL there, under the name it shipped with: `mods\<word>\dinput8.dll`.
-fn package_dll(game: &Game, host: &PackageHost, word: &str) -> RelPath {
-    RelPath::of(&format!("{}\\{}", package_dir(host, word), game.host_dll))
+/// The mod's DLL there, under the name it shipped with: `mods\<word>\dinput8.dll`, or `mods\<word>-dll\dinput8.dll`
+/// for a mod whose zip has a script package of its own in `mods\<word>\`.
+fn is_package_dll(game: &Game, host: &PackageHost, word: &str, at: &RelPath) -> bool {
+    [word.to_string(), format!("{word}{NATIVE_SUFFIX}")]
+        .iter()
+        .any(|w| package_dir(host, w).join(game.host_dll).is_ok_and(|d| d.same(at)))
+}
+
+/// The end of a DLL's own folder name when the mod's zip already uses `mods\<word>\`.
+const NATIVE_SUFFIX: &str = "-dll";
+
+/// A package host's declaration that loads the DLL dllchain puts next to it.
+fn declaration(dll: &str) -> Vec<u8> {
+    format!("[Plugin]\r\nEnabled=1\r\nDll={dll}\r\n").into_bytes()
 }
 
 /// A mod dllchain put into a package host's folder rather than the chain.
@@ -1020,8 +1055,6 @@ fn plan_install_package(
 ) -> Result<Plan> {
     let mut w = Work::new(ctx, scan, action)?;
     let host = ctx.game.display(ph.word);
-    let dir = package_dir(ph, word);
-    let dll_rel = package_dll(ctx.game, ph, word);
     let (decl, off) = (RelPath::of(ph.declaration), RelPath::of(ph.off_switch));
     let prev = w.packages.iter().position(|m| m.word == word);
     let name = match prev {
@@ -1029,16 +1062,23 @@ fn plan_install_package(
         None => default_name(info).unwrap_or_else(|| w.display(word)),
     };
     let dll_only = src.files.is_empty();
-    match src.files.iter().find(|(r, _)| r.same(&decl)) {
-        Some((_, b)) => check_declaration(b, ctx.game.host_dll).map_err(|e| Error(format!("{}: {e}", src.label)))?,
-        // a new DLL alone, for a mod that is in its folder already
-        None if dll_only && prev.is_some() => {}
-        None => fail!(
-            "{host} runs DLL mods only from a folder of their own in {}\\, and only when the mod says how, in a {decl} file. {} has none, so dllchain cannot install it with {host}. Add it with {host}'s DLL Manager instead.",
-            ph.dir,
-            src.label
-        ),
+    let shipped_decl = src.files.iter().find(|(r, _)| r.same(&decl));
+    if let Some((_, b)) = shipped_decl {
+        check_declaration(b, ctx.game.host_dll).map_err(|e| Error(format!("{}: {e}", src.label)))?;
     }
+    // A mod made for the game folder (no declaration of its own): its files go where its zip puts them, as without
+    // the host, and its DLL into a folder of its own with a declaration dllchain writes. A new DLL alone keeps the
+    // layout the mod has.
+    let game_layout = shipped_decl.is_none() && !(dll_only && prev.is_some());
+    let dir = match prev {
+        Some(i) => w.packages[i].dll_at.parent().unwrap_or_else(|| package_dir(ph, word)),
+        // the zip's own mods\<word>\ (a script package with mod.json) is not the DLL's folder
+        None if game_layout && src.files.iter().any(|(r, _)| r.strip_prefix(&package_dir(ph, word)).is_some()) => {
+            package_dir(ph, &format!("{word}{NATIVE_SUFFIX}"))
+        }
+        None => package_dir(ph, word),
+    };
+    let dll_rel = dir.join(ctx.game.host_dll)?;
     // a loader that stops the game at a folder in mods\ without mod.json (EML), other than the package host's own
     for p in ctx.game.proxy_names {
         let rel = RelPath::of(&format!("{p}.dll"));
@@ -1062,17 +1102,26 @@ fn plan_install_package(
     }
 
     let chained = w.mods.iter().position(|m| m.word == word);
+    let mut adopted_back = None;
     let mut rec = match (prev, chained) {
         (Some(i), _) => w.packages.remove(i),
         (None, Some(i)) => {
             let old = w.mods.remove(i);
-            if old.kind == Kind::Adopted {
-                fail!(
-                    "{name} is in the game folder from before dllchain (as {}), where {host} does not load it. Take it out by hand, then install it again.",
-                    old.dll_at
-                );
-            }
             if let Some(at) = locate(ctx, scan, &old) {
+                if old.kind == Kind::Adopted {
+                    // not dllchain's: kept, and Uninstall puts it back next to the game (under its own name, as
+                    // dinput8.dll is the host's)
+                    let rel =
+                        if at.same(&ctx.host()) { RelPath::parse(&format!("{}.dll", old.word))? } else { at.clone() };
+                    let bytes = ctx.read(&at).unwrap_or_default();
+                    let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", old.word))?;
+                    w.plan.steps.push(Step::Write(backup.clone(), bytes));
+                    w.plan.expect_files.push((backup.clone(), Some(old.dll_sha.clone())));
+                    w.plan.summary.push(format!(
+                        "Your copy of {name} that was {at} before dllchain is kept, and Uninstall puts it back as {rel}."
+                    ));
+                    adopted_back = Some(FileRec { rel, sha: old.dll_sha.clone(), backup: Some(backup) });
+                }
                 w.drop.push((at, old.dll_sha.clone(), old.word.clone()));
             }
             w.plan.summary.push(format!(
@@ -1104,7 +1153,8 @@ fn plan_install_package(
                     ctx.game.host_dll
                 ));
             }
-            ModRec { replaced_dll: None, ..old }
+            // a mod that was there before dllchain is dllchain's from now on: Uninstall takes the new files out
+            ModRec { kind: Kind::Installed, replaced_dll: None, ..old }
         }
         (None, None) => ModRec {
             word: word.to_string(),
@@ -1136,20 +1186,44 @@ fn plan_install_package(
     }
     fill_source(&mut rec, src, info);
     rec.dll_at = dll_rel.clone();
+    rec.retired.extend(adopted_back);
 
     let mut files = vec![(dll_rel, src.dll.clone())];
-    for (r, b) in &src.files {
-        if !r.same(&off) {
-            files.push((dir.join(r.as_str())?, b.clone()));
+    if game_layout {
+        files.extend(src.files.iter().cloned());
+        files.push((dir.join(ph.declaration)?, declaration(ctx.game.host_dll)));
+        w.plan.notes.push(format!(
+            "{name} has no {decl}, so dllchain writes one in {dir}\\: it tells {host} to load {name}. Uninstall takes it out."
+        ));
+        // a script package in the zip (mods\x\ with mod.json) is one of the host's packages, off until enabled
+        let scripts: Vec<String> = src
+            .files
+            .iter()
+            .filter(|(r, _)| r.file_name().eq_ignore_ascii_case(ph.off_switch))
+            .filter_map(|(r, _)| r.parent().filter(|p| p.first_part().eq_ignore_ascii_case(ph.dir)))
+            .map(|p| format!("{p}\\"))
+            .collect();
+        if !scripts.is_empty() {
+            w.plan.notes.push(format!(
+                "{host} keeps {} switched off until you enable it in {host}'s window: {name} needs it on to work fully.",
+                scripts.join(", ")
+            ));
+        }
+    } else {
+        for (r, b) in &src.files {
+            if !r.same(&off) {
+                files.push((dir.join(r.as_str())?, b.clone()));
+            }
         }
     }
-    retire(&mut w, &mut rec, Some(&dir), &files, Some((&dir.join(ph.off_switch)?, &host)))?;
+    let leftovers_in = if game_layout { None } else { Some(&dir) };
+    retire(&mut w, &mut rec, leftovers_in, &files, Some((&dir.join(ph.off_switch)?, &host)))?;
     let gone = if chained.is_some() { "it had next to the game" } else { NOT_IN_NEW };
     plan_files(&mut w, &mut rec, &files, &src.label, dll_only, &|r| r.strip_prefix(&dir).is_some(), gone)?;
     w.packages.push(rec);
     w.layout()?;
     w.forget_lone_host();
-    if src.files.iter().any(|(r, _)| r.same(&off)) {
+    if !game_layout && src.files.iter().any(|(r, _)| r.same(&off)) {
         w.plan.notes.push(format!(
             "{off} from the zip is left out: with it, {host} keeps the folder switched off until you enable it."
         ));

@@ -1083,21 +1083,104 @@ fn a_mod_chained_with_shroudforge_moves_into_its_folder() {
 }
 
 #[test]
-fn under_shroudforge_a_mod_that_does_not_say_how_to_load_it_is_refused() {
+fn under_shroudforge_a_mod_made_for_the_game_folder_gets_its_own_folder_and_declaration() {
+    let dir = game("shroudforge-alp");
+    let sf = shroudforge(&dir);
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    // Auto Loot Plus as its zip has it: its DLL, and a script package of its own in mods\auto-loot-plus\
+    let zip = src(
+        "AutoLootPlus-1-1-8.zip",
+        alp(),
+        &[(r"mods\auto-loot-plus\mod.json", b"{}"), (r"mods\auto-loot-plus\config.txt", b"cfg")],
+    );
+    let p = install(&c, &zip);
+    assert!(p.replaces.is_empty());
+    assert!(p.notes.iter().any(|n| n.contains("has no native-plugin.ini, so dllchain writes one")), "{:?}", p.notes);
+    assert!(
+        p.notes.iter().any(|n| n.starts_with(r"ShroudForge keeps mods\auto-loot-plus\ switched off")),
+        "{:?}",
+        p.notes
+    );
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf.clone()));
+    // the script package stays where the zip puts it, mod.json and all; the DLL gets a folder of its own
+    assert_eq!(read(&dir, r"mods\auto-loot-plus\mod.json").as_deref(), Some(&b"{}"[..]));
+    assert_eq!(read(&dir, r"mods\auto-loot-plus\config.txt").as_deref(), Some(&b"cfg"[..]));
+    let pkg = dir.join(r"mods\auto-loot-plus-dll");
+    assert_eq!(read(&pkg, "dinput8.dll"), Some(alp()));
+    assert_eq!(read(&pkg, "native-plugin.ini").as_deref(), Some(PLUGIN_INI));
+    assert!(!pkg.join("mod.json").exists());
+    assert_eq!(read(&dir, "dinput8-chain.ini"), None);
+    let st = status(&c).unwrap();
+    assert_eq!(row(&st, "auto-loot-plus").file.as_str(), r"mods\auto-loot-plus-dll\dinput8.dll");
+    assert!(st.repair.is_empty(), "{:?}", st.repair);
+
+    // a new DLL alone stays in that folder
+    install(&c, &src("dinput8.dll", alp2(), &[]));
+    assert_eq!(read(&pkg, "dinput8.dll"), Some(alp2()));
+    assert_eq!(read(&pkg, "native-plugin.ini").as_deref(), Some(PLUGIN_INI));
+
+    // enstash next to it, as a DLL alone: its own folder, with a declaration too
+    install(&c, &src("enstash.dll", enstash(), &[]));
+    assert_eq!(read(&dir, r"mods\enstash\dinput8.dll"), Some(enstash()));
+    assert_eq!(read(&dir, r"mods\enstash\native-plugin.ini").as_deref(), Some(PLUGIN_INI));
+
+    // Undo takes the written declaration out with the rest
+    run(&c, plan_undo(&c));
+    assert!(!dir.join(r"mods\enstash").exists());
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn under_shroudforge_a_declaration_that_is_wrong_is_refused() {
     let dir = game("shroudforge-refuse");
     shroudforge(&dir);
     let before = snapshot(&dir);
     let c = ctx(&dir);
-    let e = plan_install(&c, &src("AutoLootPlus.zip", alp(), &[("mods\\alp\\config.txt", b"cfg")])).unwrap_err();
-    assert!(e.0.contains("native-plugin.ini"), "{}", e.0);
-    let e = plan_install(&c, &src("enstash.dll", enstash(), &[])).unwrap_err();
-    assert!(e.0.contains("native-plugin.ini"), "{}", e.0);
     // a declaration that loads another DLL, or is switched off
     let other = src(ENSTASH_ZIP, enstash(), &[("native-plugin.ini", b"[Plugin]\r\nEnabled=1\r\nDll=other.dll\r\n")]);
     assert!(plan_install(&c, &other).unwrap_err().0.contains("loads other.dll"));
     let off = src(ENSTASH_ZIP, enstash(), &[("native-plugin.ini", b"[Plugin]\r\nEnabled=0\r\nDll=dinput8.dll\r\n")]);
     assert!(plan_install(&c, &off).unwrap_err().0.contains("Enabled=0"));
     assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn a_mod_from_before_dllchain_next_to_shroudforge_moves_into_its_folder_and_comes_back_on_uninstall() {
+    let dir = game("shroudforge-adopted");
+    // enstash put in by hand, then ShroudForge installed with dllchain: enstash is chained, where it never runs
+    let hand = fake_dll(&["enstash Quick Stack", "0.11"], None);
+    std::fs::write(dir.join("dinput8.dll"), &hand).unwrap();
+    let sf = fake_dll(&["shroudforge", "EML_LOG_FILE_PATH"], None);
+    let c = ctx(&dir);
+    install(&c, &src("ShroudForge.dll", sf.clone(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf.clone()));
+    assert_eq!(read(&dir, "enstash.dll"), Some(hand.clone()));
+
+    let p = install(&c, &enstash_zip(enstash(), b"dat"));
+    assert!(
+        p.summary.iter().any(|l| l.starts_with("Your copy of enstash that was enstash.dll before dllchain is kept")),
+        "{:?}",
+        p.summary
+    );
+    assert_eq!(read(&dir, "dinput8.dll"), Some(sf.clone()));
+    assert!(!dir.join("enstash.dll").exists());
+    assert_eq!(read(&dir, r"mods\enstash\dinput8.dll"), Some(enstash()));
+    assert!(status(&c).unwrap().repair.is_empty());
+
+    // Undo puts the hand copy back where it was
+    let moved = snapshot(&dir);
+    run(&c, plan_undo(&c));
+    assert_eq!(read(&dir, "enstash.dll"), Some(hand.clone()));
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&moved));
+
+    // Uninstall gives the hand copy back next to the game, under its own name
+    run(&c, plan_uninstall(&c, Some("enstash")));
+    assert_eq!(read(&dir, "enstash.dll"), Some(hand));
+    assert!(!dir.join(r"mods\enstash").exists());
 }
 
 #[test]
@@ -1236,4 +1319,23 @@ fn a_version_in_a_file_name() {
     assert_eq!(version_in("AutoLootPlus-1-1-8.zip"), None);
     assert_eq!(version_in("x64mod.zip"), None);
     assert_eq!(version_in("mod.zip"), None);
+}
+
+#[test]
+fn uninstalling_everything_lists_every_file_by_folder() {
+    let dir = game("uninstall-list");
+    let c = ctx(&dir);
+    install(&c, &src("AutoLootPlus.zip", alp(), &[(r"mods\auto-loot-plus\config.txt", b"cfg")]));
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    let p = plan_uninstall(&c, None).unwrap();
+    let list = p.removed_by_folder();
+    let folders: Vec<&str> = list.iter().map(|(f, _)| f.as_str()).collect();
+    assert_eq!(folders, ["", r"licenses\", r"mods\auto-loot-plus\"]);
+    assert_eq!(
+        list[0].1,
+        ["dinput8-chain.ini", "dinput8.dll", "enstash-data.dat", "enstash.dll", "mod.json", "native-plugin.ini"]
+    );
+    assert_eq!(list[2].1, ["config.txt"]);
+    // dllchain's own files are not listed
+    assert!(list.iter().flat_map(|(_, n)| n).all(|n| !n.contains("record")));
 }

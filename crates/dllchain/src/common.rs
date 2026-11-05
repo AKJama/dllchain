@@ -112,6 +112,21 @@ pub fn describe(plan: &Plan) -> String {
     s
 }
 
+/// Every file a run takes out, under the folder it is in, for the question before uninstalling everything.
+pub fn removed_text(plan: &Plan) -> String {
+    let mut s = String::new();
+    for (folder, names) in plan.removed_by_folder() {
+        match folder.as_str() {
+            "" => s.push_str("From the game folder:\n"),
+            f => s.push_str(&format!("From {f}:\n")),
+        }
+        for n in names {
+            s.push_str(&format!("    {n}\n"));
+        }
+    }
+    s
+}
+
 /// A mod's details as aligned lines: the labels in one column, the values in the next. With `tab`, a tab goes
 /// between them instead, for a text box with a tab stop.
 pub fn details_text(details: &[(String, String)], tab: bool) -> String {
