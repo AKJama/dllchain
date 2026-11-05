@@ -557,6 +557,8 @@ fn act(a: Action) {
 /// The question stays short whatever the mod holds: this many files under "Show details", this many notes in the
 /// question itself (the rest under "Show details"). The log has every change.
 const MAX_LISTED: usize = 10;
+/// Lines of the list of files Uninstall all removes in the question itself; the rest are under Show details.
+const MAX_REMOVED: usize = 30;
 const MAX_NOTES: usize = 3;
 
 /// The question for an action, and the word on its button.
@@ -608,14 +610,33 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
     if let Action::Install(_) = a {
         content.push_str("\nYou can take this back with Undo, or later with Uninstall.");
     }
-    if let Action::Uninstall(None) = a {
-        // every file, and where it is: this one cannot be undone
-        content.push_str(&format!("\nThese files are removed:\n{}", plain(&common::removed_text(plan))));
+    // every file, and where it is, as this one cannot be undone; a long list goes on under Show details, so the
+    // box stays on the screen
+    let removed = match a {
+        Action::Uninstall(None) => common::removed_text(plan),
+        _ => String::new(),
+    };
+    let removed: Vec<&str> = removed.lines().collect();
+    let (shown, rest) = removed.split_at(removed.len().min(MAX_REMOVED));
+    if !shown.is_empty() {
+        content.push_str(&format!("\nThese files are removed:\n{}\n", plain(&shown.join("\n"))));
+        if !rest.is_empty() {
+            content.push_str("The rest are under Show details.\n");
+        }
         content.push_str("\nUndo cannot take this back. Cancel changes nothing.");
     }
     let mut details = String::new();
     if !sha.is_empty() {
         details.push_str(&format!("{sha}\n\n"));
+    }
+    if !rest.is_empty() {
+        // the folder the list stopped in comes again
+        let folder = shown.iter().rev().find(|l| !l.starts_with(' ')).filter(|_| rest[0].starts_with(' '));
+        details.push_str("Also removed:\n");
+        for l in folder.into_iter().chain(rest) {
+            details.push_str(&format!("{l}\n"));
+        }
+        details.push('\n');
     }
     if plan.notes.len() > MAX_NOTES {
         details.push_str("More notes:\n");

@@ -1134,6 +1134,27 @@ fn under_shroudforge_a_mod_made_for_the_game_folder_gets_its_own_folder_and_decl
 }
 
 #[test]
+fn under_shroudforge_an_update_that_adds_a_script_package_moves_the_dll_out_of_it() {
+    let dir = game("shroudforge-alp-update");
+    shroudforge(&dir);
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    // first a version that says how it loads, in mods\auto-loot-plus\
+    install(&c, &src("AutoLootPlus-1-1-7.zip", alp(), &[("native-plugin.ini", PLUGIN_INI)]));
+    assert_eq!(read(&dir, r"mods\auto-loot-plus\dinput8.dll"), Some(alp()));
+    // then one made for the game folder, whose script package is mods\auto-loot-plus\: the DLL cannot stay there
+    let zip = src("AutoLootPlus-1-1-8.zip", alp2(), &[(r"mods\auto-loot-plus\mod.json", b"{}")]);
+    install(&c, &zip);
+    assert_eq!(read(&dir, r"mods\auto-loot-plus-dll\dinput8.dll"), Some(alp2()));
+    assert_eq!(read(&dir, r"mods\auto-loot-plus-dll\native-plugin.ini").as_deref(), Some(PLUGIN_INI));
+    assert!(!dir.join(r"mods\auto-loot-plus\dinput8.dll").exists());
+    assert_eq!(read(&dir, r"mods\auto-loot-plus\mod.json").as_deref(), Some(&b"{}"[..]));
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
 fn under_shroudforge_a_declaration_that_is_wrong_is_refused() {
     let dir = game("shroudforge-refuse");
     shroudforge(&dir);

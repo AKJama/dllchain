@@ -124,11 +124,10 @@ impl Plan {
     /// The files the run takes out of the game folder for good (dllchain's own folder aside), by the folder they are
     /// in: `""` for the game folder itself, else `mods\x\`. A file the run puts back afterwards is not one of them.
     pub fn removed_by_folder(&self) -> Vec<(String, Vec<String>)> {
-        let written = |r: &RelPath| self.steps.iter().any(|s| matches!(s, Step::Write(w, _) if w.same(r)));
         let mut out: Vec<(String, Vec<String>)> = Vec::new();
-        for s in &self.steps {
+        for (i, s) in self.steps.iter().enumerate() {
             let Step::Delete(r) = s else { continue };
-            if r.first_part().eq_ignore_ascii_case(OWN_DIR) || written(r) {
+            if r.first_part().eq_ignore_ascii_case(OWN_DIR) || put_back_after(&self.steps, i, r) {
                 continue;
             }
             let folder = r.parent().map_or(String::new(), |p| format!("{p}\\"));
@@ -144,6 +143,11 @@ impl Plan {
         }
         out
     }
+}
+
+/// Whether a step after `steps[i]` renames or writes a file onto `r` again.
+fn put_back_after(steps: &[Step], i: usize, r: &RelPath) -> bool {
+    steps[i + 1..].iter().any(|s| matches!(s, Step::Rename(_, b) | Step::Write(b, _) if b.same(r)))
 }
 
 /// What is in the game folder now.
@@ -865,14 +869,7 @@ impl<'a> Work<'a> {
                     (0, a, format!("{a} renamed to {b}"))
                 }
                 // a file another one is renamed or written onto later: that step says it
-                Step::Delete(r)
-                    if !own(r)
-                        && !steps[i + 1..]
-                            .iter()
-                            .any(|s| matches!(s, Step::Rename(_, b) | Step::Write(b, _) if b.same(r))) =>
-                {
-                    (1, r, format!("{r} (deleted)"))
-                }
+                Step::Delete(r) if !own(r) && !put_back_after(steps, i, r) => (1, r, format!("{r} (deleted)")),
                 _ => continue,
             };
             let key = if key == 1 && !rel.is_top_level() { 2 } else { key };
@@ -1070,13 +1067,11 @@ fn plan_install_package(
     // the host, and its DLL into a folder of its own with a declaration dllchain writes. A new DLL alone keeps the
     // layout the mod has.
     let game_layout = shipped_decl.is_none() && !(dll_only && prev.is_some());
-    let dir = match prev {
-        Some(i) => w.packages[i].dll_at.parent().unwrap_or_else(|| package_dir(ph, word)),
-        // the zip's own mods\<word>\ (a script package with mod.json) is not the DLL's folder
-        None if game_layout && src.files.iter().any(|(r, _)| r.strip_prefix(&package_dir(ph, word)).is_some()) => {
-            package_dir(ph, &format!("{word}{NATIVE_SUFFIX}"))
-        }
-        None => package_dir(ph, word),
+    // the zip's own mods\<word>\ (a script package with mod.json) is not the DLL's folder
+    let dir = if game_layout && src.files.iter().any(|(r, _)| r.strip_prefix(&package_dir(ph, word)).is_some()) {
+        package_dir(ph, &format!("{word}{NATIVE_SUFFIX}"))
+    } else {
+        prev.and_then(|i| w.packages[i].dll_at.parent()).unwrap_or_else(|| package_dir(ph, word))
     };
     let dll_rel = dir.join(ctx.game.host_dll)?;
     // a loader that stops the game at a folder in mods\ without mod.json (EML), other than the package host's own
@@ -1113,7 +1108,9 @@ fn plan_install_package(
                     // dinput8.dll is the host's)
                     let rel =
                         if at.same(&ctx.host()) { RelPath::parse(&format!("{}.dll", old.word))? } else { at.clone() };
-                    let bytes = ctx.read(&at).unwrap_or_default();
+                    let Some(bytes) = ctx.read_checked(&at, &old.dll_sha) else {
+                        fail!("{at} changed while dllchain was reading it, so nothing was changed. Try again.");
+                    };
                     let backup = RelPath::parse(&format!("{OWN_DIR}\\originals\\{}\\{rel}", old.word))?;
                     w.plan.steps.push(Step::Write(backup.clone(), bytes));
                     w.plan.expect_files.push((backup.clone(), Some(old.dll_sha.clone())));
