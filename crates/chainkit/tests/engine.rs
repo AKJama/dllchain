@@ -1369,6 +1369,8 @@ fn enstash_run_files(dir: &Path) {
     std::fs::write(dir.join(r"enstash-backups\2026-11-05\chests.bin"), b"chests").unwrap();
     std::fs::write(dir.join("enstash-routes.txt"), b"routes").unwrap();
     std::fs::write(dir.join("enstash-report.txt"), b"report").unwrap();
+    // enstash writes it on its first start (enstash item 78)
+    std::fs::write(dir.join("enstash-first-start.txt"), b"first start").unwrap();
 }
 
 /// Files that start like enstash's but are not its to delete, and must outlive any uninstall.
@@ -1412,6 +1414,7 @@ fn uninstall_deletes_what_the_mod_made_only_when_asked_and_undo_brings_it_back()
 
     let expected = [
         r"enstash-backups\",
+        "enstash-first-start.txt",
         r"enstash-logs\",
         "enstash-marks.txt",
         "enstash-quickstack.log",
@@ -1434,7 +1437,7 @@ fn uninstall_deletes_what_the_mod_made_only_when_asked_and_undo_brings_it_back()
     let before = snapshot(&dir);
     let p = run(&c, plan_uninstall_with(&c, Some("enstash"), true));
     assert!(p.deletes_made && p.undoable());
-    assert!(p.summary.iter().any(|l| l == "Deletes what enstash made while it ran (9 files)."), "{:?}", p.summary);
+    assert!(p.summary.iter().any(|l| l == "Deletes what enstash made while it ran (10 files)."), "{:?}", p.summary);
     for e in expected {
         assert!(!dir.join(e).exists(), "{e} is still there");
     }
@@ -1471,12 +1474,18 @@ fn under_shroudforge_what_the_mod_made_in_its_folder_goes_with_the_folder() {
     std::fs::write(dir.join(r"mods\enstash\enstash-quickstack.log"), b"log").unwrap();
     std::fs::create_dir_all(dir.join(r"mods\enstash\enstash-backups")).unwrap();
     std::fs::write(dir.join(r"mods\enstash\enstash-backups\chests.bin"), b"chests").unwrap();
+    std::fs::write(dir.join(r"mods\enstash\enstash-first-start.txt"), b"first start").unwrap();
     // from before ShroudForge, next to the game
     std::fs::write(dir.join("enstash-quickstack.log"), b"older log").unwrap();
     let p = plan_uninstall(&c, Some("enstash")).unwrap();
     assert_eq!(
         made_names(&p),
-        ["enstash-quickstack.log", r"mods\enstash\enstash-backups\", r"mods\enstash\enstash-quickstack.log"]
+        [
+            "enstash-quickstack.log",
+            r"mods\enstash\enstash-backups\",
+            r"mods\enstash\enstash-first-start.txt",
+            r"mods\enstash\enstash-quickstack.log"
+        ]
     );
     run(&c, plan_uninstall_with(&c, Some("enstash"), true));
     assert!(!dir.join(r"mods\enstash").exists());
