@@ -123,10 +123,7 @@ fn split_removed(by_folder: Vec<(String, Vec<String>)>, max: usize) -> (String, 
     let mut out = [String::new(), String::new()];
     let mut count = 0;
     for (folder, names) in by_folder {
-        let head = match folder.as_str() {
-            "" => "From the game folder:\n".to_string(),
-            f => format!("From {f}:\n"),
-        };
+        let head = folder_head(&folder);
         // each part names the folder before its first file there
         let mut headed = [false, false];
         for n in names {
@@ -144,6 +141,55 @@ fn split_removed(by_folder: Vec<(String, Vec<String>)>, max: usize) -> (String, 
         shown = format!("These files are removed:\n{shown}Undo cannot take this back.\n");
     }
     (shown, rest)
+}
+
+/// "From the game folder:" or "From mods\x\:", with its line end.
+fn folder_head(folder: &str) -> String {
+    match folder {
+        "" => "From the game folder:\n".to_string(),
+        f => format!("From {f}:\n"),
+    }
+}
+
+/// What the mods made while they ran (logs, backups, reports), for the uninstall question: the tick box's words, the
+/// list by mod and folder with what Undo can do, and, past `max` entries, the rest of the list (its mod and folder
+/// named again), for Show details. `None` when they made nothing dllchain could find.
+pub fn made_choice(plan: &Plan, max: usize) -> Option<(String, String, String)> {
+    let label = match plan.made.as_slice() {
+        [] => return None,
+        [(name, _)] => format!("Also delete {name}'s log and the other files it made"),
+        _ => "Also delete the mods' logs and the other files they made".to_string(),
+    };
+    let mut out = [String::new(), String::new()];
+    let mut count = 0;
+    for (name, items) in &plan.made {
+        // each part names the mod and the folder before its first entry there
+        let mut head: [Option<String>; 2] = [None, None];
+        for m in items {
+            let k = usize::from(count >= max);
+            let f = m.rel.parent().map_or(String::new(), |p| format!("{p}\\"));
+            if head[k].is_none() {
+                out[k].push_str(&format!("{name} made these while it ran:\n"));
+            }
+            if head[k].as_ref() != Some(&f) {
+                out[k].push_str(&folder_head(&f));
+                head[k] = Some(f);
+            }
+            out[k].push_str(&match (m.is_dir, m.files.len()) {
+                (false, _) => format!("    {}\n", m.rel.file_name()),
+                (true, 1) => format!("    {}\\ (a folder, 1 file)\n", m.rel.file_name()),
+                (true, n) => format!("    {}\\ (a folder, {n} files)\n", m.rel.file_name()),
+            });
+            count += 1;
+        }
+    }
+    let [mut shown, rest] = out;
+    shown.push_str(if plan.undoable() {
+        "If you delete them, Undo can bring them back.\n"
+    } else {
+        "If you delete them, they are gone for good: Undo cannot bring them back.\n"
+    });
+    Some((label, shown, rest))
 }
 
 /// A mod's details as aligned lines: the labels in one column, the values in the next. With `tab`, a tab goes

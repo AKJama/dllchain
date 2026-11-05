@@ -3,7 +3,7 @@
 mod common;
 mod update;
 
-use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status};
+use chainkit::engine::{Ctx, Plan, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall_with, status};
 use chainkit::hash::short;
 use chainkit::{Error, Result, source};
 use common::{GAME, Opts, describe, details_text, shown};
@@ -15,7 +15,7 @@ dllchain-cli: installs several dinput8.dll mods side by side, and takes them out
 
   dllchain-cli status
   dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
-  dllchain-cli uninstall <name> | --all [--yes]
+  dllchain-cli uninstall <name> | --all [--delete-logs] [--yes]
   dllchain-cli rename <name> <new name> [--yes]   (\"\" gives the mod its own name back)
   dllchain-cli repair [--yes]
   dllchain-cli undo [--yes]   (takes back the last change; undo again to make it again)
@@ -27,6 +27,7 @@ dllchain-cli: installs several dinput8.dll mods side by side, and takes them out
   --steam-root <folder>  Steam's folder (default: from the registry)
   --yes                  make the changes; without it dllchain only shows them
   --allow-replace        let an install replace files dllchain did not install (a copy is kept)
+  --delete-logs          on uninstall, also delete the logs and other files the mod made while it ran
 
 Exit codes: 0 done (or nothing to do), 1 refused or needs --yes/--allow-replace, 2 failed (everything undone).";
 
@@ -45,11 +46,12 @@ struct Args {
     opts: Opts,
     yes: bool,
     allow_replace: bool,
+    delete_logs: bool,
 }
 
 fn parse(args: Vec<String>) -> std::result::Result<Args, String> {
     let mut opts = Opts::default();
-    let (mut yes, mut allow_replace, mut all) = (false, false, false);
+    let (mut yes, mut allow_replace, mut all, mut delete_logs) = (false, false, false, false);
     let mut free = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -58,6 +60,7 @@ fn parse(args: Vec<String>) -> std::result::Result<Args, String> {
             "--yes" | "-y" => yes = true,
             "--allow-replace" => allow_replace = true,
             "--all" => all = true,
+            "--delete-logs" => delete_logs = true,
             "--game" => opts.game = Some(val("--game")?),
             "--steam-root" => opts.steam_root = Some(val("--steam-root")?),
             "--test-saved-games" => opts.saved_games = Some(val("--test-saved-games")?),
@@ -80,7 +83,10 @@ fn parse(args: Vec<String>) -> std::result::Result<Args, String> {
         (None, _, _) => return Err(String::new()),
         _ => return Err(format!("not a command dllchain knows: {}", free.join(" "))),
     };
-    Ok(Args { cmd, opts, yes, allow_replace })
+    if delete_logs && !matches!(cmd, Cmd::Uninstall(_)) {
+        return Err("--delete-logs goes with uninstall".to_string());
+    }
+    Ok(Args { cmd, opts, yes, allow_replace, delete_logs })
 }
 
 enum Outcome {
@@ -117,7 +123,7 @@ fn run(a: &Args) -> Result<Outcome> {
             println!("Compare that SHA-256 with the one the mod's author publishes before you install.");
             plan_install(&ctx, &src)?
         }
-        Cmd::Uninstall(w) => plan_uninstall(&ctx, w.as_deref())?,
+        Cmd::Uninstall(w) => plan_uninstall_with(&ctx, w.as_deref(), a.delete_logs)?,
         Cmd::Rename(w, n) => plan_rename(&ctx, w, Some(n))?,
         Cmd::Repair => plan_repair(&ctx)?,
         Cmd::Undo => plan_undo(&ctx)?,
@@ -129,6 +135,14 @@ fn run(a: &Args) -> Result<Outcome> {
     }
     if let Cmd::Uninstall(None) = a.cmd {
         print!("\n{}", common::removed_text(&plan, usize::MAX).0);
+    }
+    // with --all --delete-logs, the list of removed files above has them already
+    let listed = matches!(a.cmd, Cmd::Uninstall(None)) && a.delete_logs;
+    if let Some((_, list, _)) = common::made_choice(&plan, usize::MAX).filter(|_| !listed) {
+        print!("\n{list}");
+        if !a.delete_logs {
+            println!("They stay. Add --delete-logs to delete them too.");
+        }
     }
     if !plan.replaces.is_empty() && !a.allow_replace {
         return Ok(Outcome::Refused("Add --allow-replace to replace those files.".into()));

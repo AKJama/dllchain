@@ -103,6 +103,11 @@ pub struct Plan {
     pub files: Vec<String>,
     /// What the mod being installed needs and the game folder does not have: a warning, never a reason to refuse.
     pub missing: Vec<&'static Requirement>,
+    /// For an uninstall: what each mod made while it ran (its log, backups, reports), with the name players see. The
+    /// run deletes them only when asked to (`plan_uninstall_with`); otherwise they stay.
+    pub made: Vec<(String, Vec<Made>)>,
+    /// Whether the run deletes `made` too.
+    pub deletes_made: bool,
     steps: Vec<Step>,
     record: Record,
     /// Files as they must be after the run (`None`: not there).
@@ -119,6 +124,11 @@ impl Plan {
     /// Nothing on disk would change.
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
+    }
+
+    /// Undo can take the run back: dllchain's own folder, with its copies, stays.
+    pub fn undoable(&self) -> bool {
+        !self.remove_own_dir
     }
 
     /// The files the run takes out of the game folder for good (dllchain's own folder aside), by the folder they are
@@ -1760,8 +1770,14 @@ fn default_name(info: &DllInfo) -> Option<String> {
     }
 }
 
-/// Uninstall one mod (by its word) or, with `None`, everything dllchain installed.
+/// Uninstall one mod (by its word) or, with `None`, everything dllchain installed. What the mods made while they ran
+/// stays, and is listed in `made`.
 pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
+    plan_uninstall_with(ctx, word, false)
+}
+
+/// The same, and with `delete_made`, it deletes what the mods made while they ran too (their logs, backups, reports).
+pub fn plan_uninstall_with(ctx: &Ctx, word: Option<&str>, delete_made: bool) -> Result<Plan> {
     let scan = scan(ctx)?;
     let mut w = Work::new(ctx, &scan, format!("uninstall {}", word.unwrap_or("everything")))?;
     w.plan.first_install = false;
@@ -1782,6 +1798,7 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
         }
     };
     w.allow_no_host = word.is_none();
+    w.plan.deletes_made = delete_made;
     for t in &targets {
         let m = match w.packages.iter().position(|m| &m.word == t) {
             Some(i) => w.packages.remove(i),
@@ -1810,6 +1827,26 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
         undone.words(&mut w);
         if let Some(at) = at {
             w.drop.push((at, m.dll_sha.clone(), m.word.clone()));
+        }
+        let made = made_by(ctx, &scan.record, &m);
+        if delete_made && !made.is_empty() {
+            let files: usize = made.iter().map(|x| x.files.len()).sum();
+            w.plan.summary.push(format!(
+                "Deletes what {display} made while it ran ({}).",
+                if files == 1 { "1 file".to_string() } else { format!("{files} files") }
+            ));
+            for x in &made {
+                for f in &x.files {
+                    w.plan.steps.push(Step::Delete(f.clone()));
+                    w.plan.expect_files.push((f.clone(), None));
+                }
+                for d in &x.dirs {
+                    w.plan.steps.push(Step::RemoveDirIfEmpty(d.clone()));
+                }
+            }
+        }
+        if !made.is_empty() {
+            w.plan.made.push((display.clone(), made));
         }
         let mut dirs = m.dirs.clone();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.as_str().matches('\\').count()));
@@ -1851,6 +1888,114 @@ pub fn plan_uninstall(ctx: &Ctx, word: Option<&str>) -> Result<Plan> {
     w.layout()?;
     w.forget_lone_host();
     Ok(w.finish())
+}
+
+/// A file or folder a mod made while it ran.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Made {
+    /// The file or folder, as the list shows it.
+    pub rel: RelPath,
+    pub is_dir: bool,
+    /// The files to delete: `rel` itself for a file, else every file in the folder that dllchain may delete.
+    pub files: Vec<RelPath>,
+    /// The folders to remove once empty, deepest first.
+    pub dirs: Vec<RelPath>,
+}
+
+/// What a mod made while it ran: the files and folders in the game folder and in its DLL's folder whose names start
+/// with the mod's word and a `-`, `_` or `.` (`enstash-quickstack.log`, `enstash-backups\`), that no mod on dllchain's
+/// list installed. Never a DLL, a program, game data, a file the game, Steam or a loader owns, another mod's (whose
+/// longer word starts the same), nor anything behind a link.
+fn made_by(ctx: &Ctx, record: &Record, m: &ModRec) -> Vec<Made> {
+    let word = m.word.to_ascii_lowercase();
+    let starts = |n: &str, w: &str| n.strip_prefix(w).is_some_and(|r| r.starts_with(['-', '_', '.']));
+    let named = |n: &str| {
+        let n = n.to_ascii_lowercase();
+        starts(&n, &word)
+            && !record
+                .mods
+                .iter()
+                .map(|o| o.word.as_str())
+                .chain(ctx.game.tools.iter().map(|t| t.word))
+                .any(|o| o.len() > word.len() && starts(&n, &o.to_ascii_lowercase()))
+    };
+    let installed = |r: &RelPath| {
+        record.mods.iter().any(|o| {
+            o.dll_at.same(r)
+                || o.files.iter().chain(&o.retired).any(|f| f.rel.same(r))
+                || o.dirs.iter().any(|d| d.same(r))
+        })
+    };
+    let deletable = |r: &RelPath| {
+        check_target(r, ctx.game).is_ok()
+            && r.extension() != ".dll"
+            && !r.as_str().eq_ignore_ascii_case(ctx.game.game_log)
+            && !installed(r)
+    };
+    let mut out = Vec::new();
+    for folder in std::iter::once(None).chain(m.dll_at.parent().map(Some)) {
+        let Some(dir) = folder.as_ref().map_or(Some(ctx.dir.clone()), |f| resolve(&ctx.dir, f).ok()) else { continue };
+        for name in names_in(&dir) {
+            if !named(&name) {
+                continue;
+            }
+            let Ok(rel) = folder.as_ref().map_or_else(|| RelPath::parse(&name), |f| f.join(&name)) else { continue };
+            let Some(is_dir) = dir_or_file(ctx, &rel) else { continue };
+            if !deletable(&rel) {
+                continue;
+            }
+            if is_dir {
+                let (mut files, mut dirs) = (Vec::new(), Vec::new());
+                walk_made(ctx, &rel, &deletable, &mut files, &mut dirs);
+                if !files.is_empty() {
+                    out.push(Made { rel, is_dir: true, files, dirs });
+                }
+            } else {
+                out.push(Made { rel: rel.clone(), is_dir: false, files: vec![rel], dirs: Vec::new() });
+            }
+        }
+    }
+    out
+}
+
+/// The files in `dir` (and its folders) that `deletable` allows, and its folders, deepest first, `dir` last. A link
+/// and what is behind it are left out.
+fn walk_made(
+    ctx: &Ctx,
+    dir: &RelPath,
+    deletable: &dyn Fn(&RelPath) -> bool,
+    files: &mut Vec<RelPath>,
+    dirs: &mut Vec<RelPath>,
+) {
+    let Ok(path) = resolve(&ctx.dir, dir) else { return };
+    for name in names_in(&path) {
+        let Ok(rel) = dir.join(&name) else { continue };
+        let Some(is_dir) = dir_or_file(ctx, &rel) else { continue };
+        if is_dir {
+            walk_made(ctx, &rel, deletable, files, dirs);
+        } else if deletable(&rel) {
+            files.push(rel);
+        }
+    }
+    dirs.push(dir.clone());
+}
+
+/// Whether `rel` is a folder (`Some(true)`) or a file; `None` when it is gone, or is a link or behind one.
+fn dir_or_file(ctx: &Ctx, rel: &RelPath) -> Option<bool> {
+    let p = resolve(&ctx.dir, rel).ok()?;
+    std::fs::symlink_metadata(p).ok().map(|m| m.is_dir())
+}
+
+/// The names in a folder, sorted (none when it cannot be read; a name Windows cannot spell in Unicode is left out).
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    names
 }
 
 /// Puts back the files an install took out of the mod's folder (an older version's leftovers, a package host's off

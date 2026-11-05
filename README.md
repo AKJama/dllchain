@@ -42,6 +42,9 @@ Close the game and Steam first; dllchain changes nothing while either runs.
 - **Uninstall** or **Uninstall all** take mods out again.
   Uninstall all first asks whether you are sure, and lists every file it removes and the folder it is in; Cancel changes nothing.
   It cannot be undone, as dllchain's own folder goes too.
+  The logs, backups and reports a mod made while it ran (files and folders next to it whose names start with its name, such as `enstash-logs\`) stay, unless you tick "Also delete ... log and the other files it made" in the question, which lists them and where they are.
+  Undo brings them back, except after Uninstall all or uninstalling the last mod.
+  dllchain leaves anything it cannot tell is the mod's, and never touches saves, programs, DLLs or another mod's files.
 - **Undo** takes back the last change (an install, an update, an uninstall, a repair or a rename), from the copies dllchain kept of every file it changed.
   Press Undo again to make the change again.
   When a file was changed by hand after that change, Undo refuses rather than lose your edit.
@@ -64,7 +67,7 @@ The same actions are on the command line in `dllchain-cli.exe`:
 ```
 dllchain-cli status
 dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
-dllchain-cli uninstall <name> | --all [--yes]
+dllchain-cli uninstall <name> | --all [--delete-logs] [--yes]
 dllchain-cli rename <name> <new name> [--yes]
 dllchain-cli repair [--yes]
 dllchain-cli undo [--yes]
@@ -98,6 +101,7 @@ dllchain sends nothing anywhere, except when you check for updates: then it asks
 
 It never writes programs (`.exe`), game data, Steam's files or another loader's own files, and never writes outside the game folder (apart from that one save copy).
 Uninstall removes only what dllchain created, and gives back the rest byte for byte.
+The files a mod made while it ran go only when you ask (the tick box, or `--delete-logs`).
 If a run fails or is cut off, everything it changed is undone, from `dllchain\journal.txt`, before anything else happens.
 The last finished run is kept in `dllchain\undo.txt`, with copies of what it changed, so Undo can take it back.
 

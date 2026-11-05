@@ -4,8 +4,8 @@
 use chainkit::chainini::ChainFile;
 use chainkit::dllinfo::{fake_dll, fake_dll_with};
 use chainkit::engine::{
-    Ctx, Load, Plan, Row, Status, apply, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status,
-    version_in,
+    Ctx, Load, Plan, Row, Status, apply, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall,
+    plan_uninstall_with, status, version_in,
 };
 use chainkit::game::ENSHROUDED;
 use chainkit::hash::sha256_hex;
@@ -1359,4 +1359,129 @@ fn uninstalling_everything_lists_every_file_by_folder() {
     assert_eq!(list[2].1, ["config.txt"]);
     // dllchain's own files are not listed
     assert!(list.iter().flat_map(|(_, n)| n).all(|n| !n.contains("record")));
+}
+
+/// What enstash writes while it runs, next to its DLL, besides the player's files `enstash_user_files` makes.
+fn enstash_run_files(dir: &Path) {
+    std::fs::create_dir_all(dir.join("enstash-logs")).unwrap();
+    std::fs::create_dir_all(dir.join(r"enstash-backups\2026-11-05")).unwrap();
+    std::fs::write(dir.join(r"enstash-logs\run-1.log"), b"run").unwrap();
+    std::fs::write(dir.join(r"enstash-backups\2026-11-05\chests.bin"), b"chests").unwrap();
+    std::fs::write(dir.join("enstash-routes.txt"), b"routes").unwrap();
+    std::fs::write(dir.join("enstash-report.txt"), b"report").unwrap();
+}
+
+/// Files that start like enstash's but are not its to delete, and must outlive any uninstall.
+fn not_enstash_files(dir: &Path) -> Vec<&'static str> {
+    let files = ["enstash-tool.exe", "enstash-extra.dll", "enstashish.txt", "my-enstash.log", "enshrouded.log"];
+    for f in files {
+        std::fs::write(dir.join(f), b"not enstash's").unwrap();
+    }
+    files.to_vec()
+}
+
+fn made_names(p: &Plan) -> Vec<String> {
+    p.made
+        .iter()
+        .flat_map(|(_, m)| m)
+        .map(|m| if m.is_dir { format!("{}\\", m.rel) } else { m.rel.to_string() })
+        .collect()
+}
+
+#[test]
+fn uninstall_deletes_what_the_mod_made_only_when_asked_and_undo_brings_it_back() {
+    let dir = game("made-chained");
+    let c = ctx(&dir);
+    install(&c, &src("AutoLootPlus-1-1-8.zip", alp(), &[]));
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    enstash_user_files(&dir);
+    enstash_run_files(&dir);
+    let traps = not_enstash_files(&dir);
+    // a link that looks like enstash's: neither it nor what it points at is touched
+    let outside = game("made-chained-outside");
+    std::fs::write(outside.join("keep.txt"), b"elsewhere").unwrap();
+    let linked = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(dir.join("enstash-link"))
+        .arg(&outside)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(linked, "could not make a junction");
+
+    let expected = [
+        r"enstash-backups\",
+        r"enstash-logs\",
+        "enstash-marks.txt",
+        "enstash-quickstack.log",
+        "enstash-quickstack.off",
+        "enstash-report.txt",
+        "enstash-routes.txt",
+        "enstash-settings.ini",
+    ];
+    // asked for nothing: listed, and left
+    let p = run(&c, plan_uninstall(&c, Some("enstash")));
+    assert_eq!(made_names(&p), expected);
+    assert_eq!(p.made[0].0, "enstash");
+    assert!(!p.deletes_made && p.undoable());
+    user_files_kept(&dir);
+    assert_eq!(read(&dir, "enstash-routes.txt").as_deref(), Some(&b"routes"[..]));
+    run(&c, plan_undo(&c));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash()));
+
+    // asked: deleted, and nothing else
+    let before = snapshot(&dir);
+    let p = run(&c, plan_uninstall_with(&c, Some("enstash"), true));
+    assert!(p.deletes_made && p.undoable());
+    assert!(p.summary.iter().any(|l| l == "Deletes what enstash made while it ran (9 files)."), "{:?}", p.summary);
+    for e in expected {
+        assert!(!dir.join(e).exists(), "{e} is still there");
+    }
+    for t in &traps {
+        assert_eq!(read(&dir, t).as_deref(), Some(&b"not enstash's"[..]), "{t}");
+    }
+    assert_eq!(read(&outside, "keep.txt").as_deref(), Some(&b"elsewhere"[..]));
+    assert!(dir.join("enstash-link").exists());
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    clean(&dir);
+
+    // Auto Loot Plus is still there, so dllchain's copies are too: Undo brings it all back
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+    user_files_kept(&dir);
+
+    // the last mod: dllchain's folder goes, so it cannot be undone
+    let p = run(&c, plan_uninstall_with(&c, None, true));
+    assert!(!p.undoable());
+    assert!(!dir.join("enstash-logs").exists() && !dir.join("dllchain").exists());
+    assert!(!dir.join("enstash-marks.txt").exists());
+    for t in &traps {
+        assert!(dir.join(t).exists(), "{t}");
+    }
+    clean(&dir);
+}
+
+#[test]
+fn under_shroudforge_what_the_mod_made_in_its_folder_goes_with_the_folder() {
+    let dir = game("made-shroudforge");
+    shroudforge(&dir);
+    let c = ctx(&dir);
+    install(&c, &enstash_zip(enstash(), b"dat"));
+    std::fs::write(dir.join(r"mods\enstash\enstash-quickstack.log"), b"log").unwrap();
+    std::fs::create_dir_all(dir.join(r"mods\enstash\enstash-backups")).unwrap();
+    std::fs::write(dir.join(r"mods\enstash\enstash-backups\chests.bin"), b"chests").unwrap();
+    // from before ShroudForge, next to the game
+    std::fs::write(dir.join("enstash-quickstack.log"), b"older log").unwrap();
+    let p = plan_uninstall(&c, Some("enstash")).unwrap();
+    assert_eq!(
+        made_names(&p),
+        ["enstash-quickstack.log", r"mods\enstash\enstash-backups\", r"mods\enstash\enstash-quickstack.log"]
+    );
+    run(&c, plan_uninstall_with(&c, Some("enstash"), true));
+    assert!(!dir.join(r"mods\enstash").exists());
+    assert!(!dir.join("enstash-quickstack.log").exists());
+    // ShroudForge and its packages are untouched
+    assert!(dir.join(r"mods\sf-survival\mod.json").exists() && dir.join(r"shroudforge\settings.json").exists());
+    clean(&dir);
 }

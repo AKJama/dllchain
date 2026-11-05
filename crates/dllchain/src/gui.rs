@@ -7,7 +7,8 @@ mod common;
 mod update;
 
 use chainkit::engine::{
-    Ctx, Load, Plan, Row, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, status,
+    Ctx, Load, Plan, Row, plan_install, plan_rename, plan_repair, plan_undo, plan_uninstall, plan_uninstall_with,
+    status,
 };
 use chainkit::hash::short;
 use chainkit::{Error, Result, source, steam};
@@ -47,7 +48,7 @@ use windows_sys::Win32::UI::Shell::{
     FOLDERID_Downloads, HDROP, SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-use windows_sys::core::HRESULT;
+use windows_sys::core::{BOOL, HRESULT};
 
 const ID_GAME: i32 = 101;
 const ID_CHANGE: i32 = 102;
@@ -519,9 +520,22 @@ fn act(a: Action) {
             o.apply(&ctx, &plan)?;
             return Ok(format!("{head}Done: {}", plan.summary.join("\n")));
         }
-        if !confirm(&a, &plan, &sha) {
+        let Some(delete_made) = confirm(&a, &plan, &sha) else {
             return Ok(format!("{head}Nothing was changed."));
-        }
+        };
+        let plan = match &a {
+            Action::Uninstall(w) if delete_made => {
+                let with = plan_uninstall_with(&ctx, w.as_deref(), true)?;
+                // only what the question listed
+                if with.made != plan.made {
+                    return Ok(format!(
+                        "{head}Nothing was changed: the files the mod made changed while you were asked. Try again."
+                    ));
+                }
+                with
+            }
+            _ => plan,
+        };
         let mut out = head;
         for l in o.apply(&ctx, &plan)? {
             out.push_str(&format!("{l}\n"));
@@ -559,6 +573,8 @@ fn act(a: Action) {
 const MAX_LISTED: usize = 10;
 /// Lines of the list of files Uninstall all removes in the question itself; the rest are under Show details.
 const MAX_REMOVED: usize = 30;
+/// Entries of what the mods made shown in the uninstall question; the rest are under Show details.
+const MAX_MADE: usize = 10;
 const MAX_NOTES: usize = 3;
 
 /// The question for an action, and the word on its button.
@@ -582,8 +598,9 @@ fn sentence(n: &str) -> String {
 }
 
 /// Asks before a change, in plain words, one idea per line; under "Show details" the mod's SHA-256, the first files
-/// that change and how many more. True when the player said yes.
-fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
+/// that change and how many more; for an uninstall, a tick box to delete what the mods made too. `None` when the player
+/// did not say yes, else whether they ticked that box.
+fn confirm(a: &Action, plan: &Plan, sha: &str) -> Option<bool> {
     let (verb, question) = question(a, plan);
     // with links on, a "<a" in a mod's name or file would be a link too
     let links = !plan.missing.is_empty();
@@ -621,7 +638,20 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
         if !rest.is_empty() {
             content.push_str("The rest of the list is under Show details.\n");
         }
-        content.push_str("Cancel changes nothing.");
+    }
+    // what the mods made while they ran (only an uninstall finds it) stays unless the player ticks the box under the
+    // list; a long list goes on under Show details too
+    let made = common::made_choice(plan, MAX_MADE);
+    let mut made_rest = String::new();
+    if let Some((_, list, more)) = &made {
+        content.push_str(&format!("\n{}", plain(list)));
+        if !more.is_empty() {
+            content.push_str("The rest of that list is under Show details.\n");
+        }
+        made_rest = more.clone();
+    }
+    if let Action::Uninstall(_) = a {
+        content.push_str("\nCancel changes nothing.");
     }
     let mut details = String::new();
     if !sha.is_empty() {
@@ -629,6 +659,9 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
     }
     if !rest.is_empty() {
         details.push_str(&format!("Also removed:\n{rest}\n"));
+    }
+    if !made_rest.is_empty() {
+        details.push_str(&format!("Also made while they ran:\n{made_rest}\n"));
     }
     if plan.notes.len() > MAX_NOTES {
         details.push_str("More notes:\n");
@@ -650,9 +683,10 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
     let (title, main, text, more) =
         (wide("dllchain"), wide(&question), wide(&crlf(content.trim_end())), wide(&crlf(&plain(details.trim_end()))));
     let (show, hide, go) = (wide("Show details"), wide("Hide details"), wide(&format!("&{verb}")));
+    let tick = made.as_ref().map(|(label, _, _)| wide(label));
     const ID_GO: i32 = 100;
     let buttons = [TASKDIALOG_BUTTON { nButtonID: ID_GO, pszButtonText: go.as_ptr() }];
-    let mut pressed = 0;
+    let (mut pressed, mut ticked): (i32, BOOL) = (0, 0);
     // SAFETY: TASKDIALOGCONFIG is plain data; every string and the button array outlive the call.
     let ok = unsafe {
         let mut tc: TASKDIALOGCONFIG = std::mem::zeroed();
@@ -676,9 +710,13 @@ fn confirm(a: &Action, plan: &Plan, sha: &str) -> bool {
         tc.pszExpandedInformation = more.as_ptr();
         tc.pszExpandedControlText = hide.as_ptr();
         tc.pszCollapsedControlText = show.as_ptr();
-        TaskDialogIndirect(&tc, &mut pressed, null_mut(), null_mut())
+        // unticked to start with
+        if let Some(t) = &tick {
+            tc.pszVerificationText = t.as_ptr();
+        }
+        TaskDialogIndirect(&tc, &mut pressed, null_mut(), &mut ticked)
     };
-    ok == 0 && pressed == ID_GO
+    (ok == 0 && pressed == ID_GO).then_some(tick.is_some() && ticked != 0)
 }
 
 /// A link in the question was clicked: opens it when it is a requirement's page, nothing else.
