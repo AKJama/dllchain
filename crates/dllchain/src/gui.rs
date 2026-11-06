@@ -520,20 +520,17 @@ fn act(a: Action) {
             o.apply(&ctx, &plan)?;
             return Ok(format!("{head}Done: {}", plan.summary.join("\n")));
         }
+        // the same uninstall that also deletes what the mods made, planned from the same folder as the question, for
+        // the tick box
+        let with_made = match &a {
+            Action::Uninstall(w) if !plan.made.is_empty() => Some(plan_uninstall_with(&ctx, w.as_deref(), true)?),
+            _ => None,
+        };
         let Some(delete_made) = confirm(&a, &plan, &sha) else {
             return Ok(format!("{head}Nothing was changed."));
         };
-        let plan = match &a {
-            Action::Uninstall(w) if delete_made => {
-                let with = plan_uninstall_with(&ctx, w.as_deref(), true)?;
-                // only what the question listed
-                if with.made != plan.made {
-                    return Ok(format!(
-                        "{head}Nothing was changed: the files the mod made changed while you were asked. Try again."
-                    ));
-                }
-                with
-            }
+        let plan = match (with_made, delete_made) {
+            (Some(with), true) => with,
             _ => plan,
         };
         let mut out = head;

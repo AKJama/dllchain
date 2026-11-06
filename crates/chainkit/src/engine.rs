@@ -106,8 +106,6 @@ pub struct Plan {
     /// For an uninstall: what each mod made while it ran (its log, backups, reports), with the name players see. The
     /// run deletes them only when asked to (`plan_uninstall_with`); otherwise they stay.
     pub made: Vec<(String, Vec<Made>)>,
-    /// Whether the run deletes `made` too.
-    pub deletes_made: bool,
     steps: Vec<Step>,
     record: Record,
     /// Files as they must be after the run (`None`: not there).
@@ -1798,7 +1796,6 @@ pub fn plan_uninstall_with(ctx: &Ctx, word: Option<&str>, delete_made: bool) -> 
         }
     };
     w.allow_no_host = word.is_none();
-    w.plan.deletes_made = delete_made;
     for t in &targets {
         let m = match w.packages.iter().position(|m| &m.word == t) {
             Some(i) => w.packages.remove(i),
@@ -1905,20 +1902,18 @@ pub struct Made {
 /// What a mod made while it ran: the files and folders in the game folder and in its DLL's folder whose names start
 /// with the mod's word and a `-`, `_` or `.` (`enstash-quickstack.log`, `enstash-backups\`), that no mod on dllchain's
 /// list installed. Never a DLL, a program, game data, a file the game, Steam or a loader owns, another mod's (whose
-/// longer word starts the same), nor anything behind a link.
+/// longer word starts the same, on dllchain's list or a DLL beside it, such as `enstash-extra.dll`'s
+/// `enstash-extra.log`), nor anything behind a link.
 fn made_by(ctx: &Ctx, record: &Record, m: &ModRec) -> Vec<Made> {
     let word = m.word.to_ascii_lowercase();
     let starts = |n: &str, w: &str| n.strip_prefix(w).is_some_and(|r| r.starts_with(['-', '_', '.']));
-    let named = |n: &str| {
-        let n = n.to_ascii_lowercase();
-        starts(&n, &word)
-            && !record
-                .mods
-                .iter()
-                .map(|o| o.word.as_str())
-                .chain(ctx.game.tools.iter().map(|t| t.word))
-                .any(|o| o.len() > word.len() && starts(&n, &o.to_ascii_lowercase()))
-    };
+    let known: Vec<String> = record
+        .mods
+        .iter()
+        .map(|o| o.word.as_str())
+        .chain(ctx.game.tools.iter().map(|t| t.word))
+        .map(str::to_ascii_lowercase)
+        .collect();
     let installed = |r: &RelPath| {
         record.mods.iter().any(|o| {
             o.dll_at.same(r)
@@ -1935,8 +1930,13 @@ fn made_by(ctx: &Ctx, record: &Record, m: &ModRec) -> Vec<Made> {
     let mut out = Vec::new();
     for folder in std::iter::once(None).chain(m.dll_at.parent().map(Some)) {
         let Some(dir) = folder.as_ref().map_or(Some(ctx.dir.clone()), |f| resolve(&ctx.dir, f).ok()) else { continue };
-        for name in names_in(&dir) {
-            if !named(&name) {
+        let names = names_in(&dir);
+        // a mod's own word, and any DLL's here, claims what starts with it
+        let lower: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+        let dlls = lower.iter().filter_map(|n| n.strip_suffix(".dll")).map(str::to_string);
+        let claims: Vec<String> = known.iter().cloned().chain(dlls).filter(|o| o.len() > word.len()).collect();
+        for (name, n) in names.into_iter().zip(&lower) {
+            if !starts(n, &word) || claims.iter().any(|o| starts(n, o)) {
                 continue;
             }
             let Ok(rel) = folder.as_ref().map_or_else(|| RelPath::parse(&name), |f| f.join(&name)) else { continue };

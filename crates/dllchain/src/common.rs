@@ -120,27 +120,31 @@ pub fn removed_text(plan: &Plan, max: usize) -> (String, String) {
 }
 
 fn split_removed(by_folder: Vec<(String, Vec<String>)>, max: usize) -> (String, String) {
-    let mut out = [String::new(), String::new()];
-    let mut count = 0;
-    for (folder, names) in by_folder {
-        let head = folder_head(&folder);
-        // each part names the folder before its first file there
-        let mut headed = [false, false];
-        for n in names {
-            let k = usize::from(count >= max);
-            if !headed[k] {
-                out[k].push_str(&head);
-                headed[k] = true;
-            }
-            out[k].push_str(&format!("    {n}\n"));
-            count += 1;
-        }
-    }
-    let [mut shown, rest] = out;
+    let lines = by_folder
+        .into_iter()
+        .flat_map(|(folder, names)| names.into_iter().map(move |n| (vec![folder_head(&folder)], format!("    {n}\n"))));
+    let [mut shown, rest] = split_list(lines, max);
     if !shown.is_empty() {
         shown = format!("These files are removed:\n{shown}Undo cannot take this back.\n");
     }
     (shown, rest)
+}
+
+/// Lines under their headings (outermost first, each with its line end): the first `max` lines in the first part, the
+/// rest in the second. Each part gives a line's headings again where they differ from the line before it there.
+fn split_list(lines: impl IntoIterator<Item = (Vec<String>, String)>, max: usize) -> [String; 2] {
+    let mut out = [String::new(), String::new()];
+    let mut last: [Vec<String>; 2] = Default::default();
+    for (count, (heads, line)) in lines.into_iter().enumerate() {
+        let k = usize::from(count >= max);
+        let same = last[k].iter().zip(&heads).take_while(|(a, b)| a == b).count();
+        for h in &heads[same..] {
+            out[k].push_str(h);
+        }
+        out[k].push_str(&line);
+        last[k] = heads;
+    }
+    out
 }
 
 /// "From the game folder:" or "From mods\x\:", with its line end.
@@ -160,30 +164,18 @@ pub fn made_choice(plan: &Plan, max: usize) -> Option<(String, String, String)> 
         [(name, _)] => format!("Also delete {name}'s log and the other files it made"),
         _ => "Also delete the mods' logs and the other files they made".to_string(),
     };
-    let mut out = [String::new(), String::new()];
-    let mut count = 0;
-    for (name, items) in &plan.made {
-        // each part names the mod and the folder before its first entry there
-        let mut head: [Option<String>; 2] = [None, None];
-        for m in items {
-            let k = usize::from(count >= max);
-            let f = m.rel.parent().map_or(String::new(), |p| format!("{p}\\"));
-            if head[k].is_none() {
-                out[k].push_str(&format!("{name} made these while it ran:\n"));
-            }
-            if head[k].as_ref() != Some(&f) {
-                out[k].push_str(&folder_head(&f));
-                head[k] = Some(f);
-            }
-            out[k].push_str(&match (m.is_dir, m.files.len()) {
+    let lines = plan.made.iter().flat_map(|(name, items)| {
+        items.iter().map(move |m| {
+            let folder = m.rel.parent().map_or(String::new(), |p| format!("{p}\\"));
+            let line = match (m.is_dir, m.files.len()) {
                 (false, _) => format!("    {}\n", m.rel.file_name()),
                 (true, 1) => format!("    {}\\ (a folder, 1 file)\n", m.rel.file_name()),
                 (true, n) => format!("    {}\\ (a folder, {n} files)\n", m.rel.file_name()),
-            });
-            count += 1;
-        }
-    }
-    let [mut shown, rest] = out;
+            };
+            (vec![format!("{name} made these while it ran:\n"), folder_head(&folder)], line)
+        })
+    });
+    let [mut shown, rest] = split_list(lines, max);
     shown.push_str(if plan.undoable() {
         "If you delete them, Undo can bring them back.\n"
     } else {
@@ -242,6 +234,22 @@ mod tests {
         let (shown, rest) = split_removed(list(), usize::MAX);
         assert!(shown.contains("    b.lua\n") && rest.is_empty(), "{shown}");
         assert_eq!(split_removed(Vec::new(), 3), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn a_list_gives_its_headings_again_where_they_change_and_after_the_cut() {
+        let line = |heads: &[&str], l: &str| (heads.iter().map(|h| h.to_string()).collect(), l.to_string());
+        let lines = [
+            line(&["a:\n", "game:\n"], "  1\n"),
+            line(&["a:\n", "game:\n"], "  2\n"),
+            line(&["b:\n", "game:\n"], "  3\n"),
+            line(&["b:\n", "mods:\n"], "  4\n"),
+        ];
+        let [shown, rest] = split_list(lines.clone(), 3);
+        assert_eq!(shown, "a:\ngame:\n  1\n  2\nb:\ngame:\n  3\n");
+        assert_eq!(rest, "b:\nmods:\n  4\n");
+        let [shown, rest] = split_list(lines, usize::MAX);
+        assert!(shown.ends_with("  3\nmods:\n  4\n") && rest.is_empty(), "{shown}");
     }
 
     #[test]

@@ -1375,7 +1375,14 @@ fn enstash_run_files(dir: &Path) {
 
 /// Files that start like enstash's but are not its to delete, and must outlive any uninstall.
 fn not_enstash_files(dir: &Path) -> Vec<&'static str> {
-    let files = ["enstash-tool.exe", "enstash-extra.dll", "enstashish.txt", "my-enstash.log", "enshrouded.log"];
+    let files = [
+        "enstash-tool.exe",
+        "enstash-extra.dll",
+        "enstash-extra.log",
+        "enstashish.txt",
+        "my-enstash.log",
+        "enshrouded.log",
+    ];
     for f in files {
         std::fs::write(dir.join(f), b"not enstash's").unwrap();
     }
@@ -1427,7 +1434,7 @@ fn uninstall_deletes_what_the_mod_made_only_when_asked_and_undo_brings_it_back()
     let p = run(&c, plan_uninstall(&c, Some("enstash")));
     assert_eq!(made_names(&p), expected);
     assert_eq!(p.made[0].0, "enstash");
-    assert!(!p.deletes_made && p.undoable());
+    assert!(p.undoable() && !p.summary.iter().any(|l| l.starts_with("Deletes what")), "{:?}", p.summary);
     user_files_kept(&dir);
     assert_eq!(read(&dir, "enstash-routes.txt").as_deref(), Some(&b"routes"[..]));
     run(&c, plan_undo(&c));
@@ -1436,7 +1443,7 @@ fn uninstall_deletes_what_the_mod_made_only_when_asked_and_undo_brings_it_back()
     // asked: deleted, and nothing else
     let before = snapshot(&dir);
     let p = run(&c, plan_uninstall_with(&c, Some("enstash"), true));
-    assert!(p.deletes_made && p.undoable());
+    assert!(p.undoable());
     assert!(p.summary.iter().any(|l| l == "Deletes what enstash made while it ran (10 files)."), "{:?}", p.summary);
     for e in expected {
         assert!(!dir.join(e).exists(), "{e} is still there");
