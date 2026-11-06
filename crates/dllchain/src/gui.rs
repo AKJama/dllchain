@@ -17,11 +17,11 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DeleteObject, GetDC, GetSysColor,
-    GetSysColorBrush, GetTextMetricsW, HDC, HFONT, ReleaseDC, SelectObject, SetBkColor, SetTextColor, TEXTMETRICW,
-    UpdateWindow,
+    GetSysColorBrush, GetTextExtentPoint32W, GetTextMetricsW, HDC, HFONT, ReleaseDC, SelectObject, SetBkColor,
+    SetTextColor, TEXTMETRICW, UpdateWindow,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -282,14 +282,51 @@ fn layout() {
     place(c.list, m, list_top, w - 2 * m, list_h);
     let by = list_top + list_h + s(10);
     let n = c.buttons.len() as i32;
-    let bw = ((w - 2 * m - (n - 1) * gap) / n).min(s(150));
-    for (i, b) in c.buttons.iter().enumerate() {
-        place(*b, m + i as i32 * (bw + gap), by, bw, bh);
+    let widths = button_widths(&button_needs(&c, s), w - 2 * m - (n - 1) * gap, s(150));
+    let mut x = m;
+    for (b, bw) in c.buttons.iter().zip(widths) {
+        place(*b, x, by, bw, bh);
+        x += bw + gap;
     }
     let ly = by + bh + s(10);
     place(c.log, m, ly, w - 2 * m, h - ly - m);
     size_columns();
     fit_scrollbar();
+}
+
+/// The buttons' widths in `room`: each as wide as its label needs, and all grown evenly towards `widest` while there is
+/// room; squeezed by the same share only when the window is too narrow for the labels.
+fn button_widths(needs: &[i32], room: i32, widest: i32) -> Vec<i32> {
+    let total = |t: i32| needs.iter().map(|&n| n.max(t)).sum::<i32>();
+    if total(0) > room {
+        return needs.iter().map(|&n| n * room.max(0) / total(0).max(1)).collect();
+    }
+    // the widest common width that still fits
+    let t = (0..=widest).rev().find(|&t| total(t) <= room).unwrap_or(0);
+    needs.iter().map(|&n| n.max(t)).collect()
+}
+
+/// What each button needs: its label and room around it.
+fn button_needs(c: &Ctl, s: impl Fn(i32) -> i32) -> Vec<i32> {
+    c.buttons.iter().map(|b| text_width(*b, c.font) + s(20)).collect()
+}
+
+/// How wide a control's text is in `font`, in pixels.
+fn text_width(hw: HWND, font: HFONT) -> i32 {
+    let mut buf = [0u16; 128];
+    let mut size = SIZE { cx: 0, cy: 0 };
+    // SAFETY: our control and its font, on a DC that is released again; the buffer outlives the calls.
+    unsafe {
+        let len = GetWindowTextW(hw, buf.as_mut_ptr(), buf.len() as i32);
+        let dc = GetDC(hw);
+        let old = SelectObject(dc, font as _);
+        // the "&" of a keyboard shortcut takes no room
+        let text: Vec<u16> = buf[..len.max(0) as usize].iter().copied().filter(|&ch| ch != u16::from(b'&')).collect();
+        GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut size);
+        SelectObject(dc, old);
+        ReleaseDC(hw, dc);
+    }
+    size.cx
 }
 
 /// The message pane's scroll bar only when its text does not fit.
@@ -1021,7 +1058,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe {
                 let d = GetDpiForWindow(hwnd).max(96) as i32;
                 let mmi = lp as *mut MINMAXINFO;
-                (*mmi).ptMinTrackSize.x = 760 * d / 96;
+                // wide enough for every button's label too, once the buttons exist
+                let mut need = 0;
+                if let Some(c) = CTL.with(|c| c.get()) {
+                    let (mut wr, mut cr) = (std::mem::zeroed::<RECT>(), std::mem::zeroed::<RECT>());
+                    GetWindowRect(hwnd, &mut wr);
+                    GetClientRect(hwnd, &mut cr);
+                    let frame = (wr.right - wr.left) - (cr.right - cr.left);
+                    let s = |v: i32| v * d / 96;
+                    let n = c.buttons.len() as i32;
+                    need = button_needs(&c, s).iter().sum::<i32>() + (n - 1) * s(8) + 2 * s(12) + frame;
+                }
+                (*mmi).ptMinTrackSize.x = (760 * d / 96).max(need);
                 (*mmi).ptMinTrackSize.y = 440 * d / 96;
             }
             0
@@ -1195,5 +1243,21 @@ fn main() {
                 DispatchMessageW(&msg);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::button_widths;
+
+    #[test]
+    fn buttons_fit_their_labels_and_share_the_rest_evenly() {
+        // room to spare: all grow to the widest allowed, a long label keeps what it needs
+        assert_eq!(button_widths(&[50, 120, 60], 600, 150), [150, 150, 150]);
+        assert_eq!(button_widths(&[50, 180, 60], 600, 150), [150, 180, 150]);
+        // some room: the short ones grow evenly, the long one keeps its own width
+        assert_eq!(button_widths(&[50, 120, 60], 330, 150), [105, 120, 105]);
+        // no room for the labels: everything shrinks by the same share
+        assert_eq!(button_widths(&[100, 100], 100, 150), [50, 50]);
     }
 }
