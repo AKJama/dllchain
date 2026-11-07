@@ -84,6 +84,7 @@ Without `--yes` it only shows what it would do.
 
 - One mod that can start others becomes `dinput8.dll`; every other mod is renamed to `<name>.dll` and listed in `dinput8-chain.ini`.
 - When a loader for other mods is `dinput8.dll` (EMF, XHL-Core, ModLoader Proxy), it stays `dinput8.dll` and every mod is listed in its own list file; dllchain never touches the loader itself (see "Works with").
+  XHL-Core's zip is the one loader zip dllchain installs: Core becomes `dinput8.dll`, and the mod that was `dinput8.dll` before is renamed and listed first, so it still starts first.
 - When ShroudForge is installed, it stays `dinput8.dll` and each mod goes into a folder of its own, `mods\<name>\`, where ShroudForge loads it; no chain is used.
   A mod that ships a `native-plugin.ini` (which says which DLL to load), as enstash does, goes into that folder whole.
   A `mod.json` from the zip is left out of that folder, as ShroudForge does not load a native mod from a folder that has one.
@@ -129,7 +130,11 @@ Status (and the window) says which one is in charge, in a line such as "XHL-Core
   That works whether `LoadFromFolder` is on or off, so dllchain does not drop loose DLLs into its mods folder, which by default is the same `mods\` folder other tools use.
 - **ShroudForge**: each mod goes into a folder of its own under `mods\`, where ShroudForge loads it; `dinput8-chain.ini` is left as it is.
 - **Multi DLL Installer**: the mods it renamed to `dinput9.dll`, `dinput10.dll` and so on are left as they are and noted in status; dllchain never gives a mod such a name.
-- A loader's own zip is not installed as a mod: install the loader first, then dllchain adds your mods to its list.
+- **XHL-Core** can also come after your mods: install its zip and it becomes `dinput8.dll`, the mod that was `dinput8.dll` (such as Auto Loot Plus) is renamed and listed first in `dinput8-chain.ini`, and the rest of the chain stays.
+  XHL plugins (such as Area Harvest, which ships `mods\<name>\native-plugin.ini`) then install as usual, and Core loads them.
+  Uninstalling Core puts the old `dinput8.dll` and the chain back as they were.
+- Any other loader's own zip is not installed as a mod: install the loader by hand first, then dllchain adds your mods to its list.
+  dllchain never puts one loader in place of another, or a loader next to ShroudForge.
 
 In any list file, dllchain only adds and removes its own mods' lines.
 Everything else stays as it was: other sections (such as `[EMF]` or `[Settings]`), `[Options]` and its `Forward=` line, comments, blank lines, the order and each line's line ending.
