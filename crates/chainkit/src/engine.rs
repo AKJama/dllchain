@@ -562,10 +562,10 @@ impl<'a> Work<'a> {
         }
         let host = self.ctx.host();
         let word = info.word.as_ref().map(|w| w.0.clone());
-        let loader_word = |i: &DllInfo| i.loader.map(|l| l.word);
+        // the same word, and both loaders or both not (a loader's word is its loader's)
         let same_tool = installing
-            .filter(|(w, new)| word.as_deref() == Some(*w) && loader_word(new) == loader_word(info))
-            .map(|(w, new)| (w.to_string(), new.sha256 == info.sha256));
+            .filter(|(w, new)| word.as_deref() == Some(*w) && new.loader.is_some() == info.loader.is_some())
+            .map(|(w, new)| (w, new.sha256 == info.sha256));
         // a loader put in by hand stays as it is, unless this installs that same loader over it
         if info.loader.is_some() && same_tool.is_none() {
             return None;
@@ -575,7 +575,7 @@ impl<'a> Work<'a> {
             return None;
         }
         if let Some((w, identical)) = same_tool {
-            let name = self.display(&w);
+            let name = self.display(w);
             if identical {
                 self.plan.summary.push(format!(
                     "{name} is already in your game, the same file: dllchain lists it, and Uninstall leaves it."
@@ -583,9 +583,9 @@ impl<'a> Work<'a> {
             } else {
                 self.plan.summary.push(format!("The new {name} takes the place of the older copy in your game."));
                 self.plan.summary.push("dllchain keeps the older copy, and Uninstall puts it back.".into());
-                self.drop.push((host, info.sha256.clone(), w.clone()));
+                self.drop.push((host, info.sha256.clone(), w.to_string()));
             }
-            self.write_store(&w, bytes);
+            self.write_store(w, bytes);
             return Some(info.sha256.clone());
         }
         if let Some(i) = word.as_ref().and_then(|w| self.mods.iter().position(|m| &m.word == w)) {
@@ -663,8 +663,8 @@ impl<'a> Work<'a> {
             drop.iter().any(|(d, s, _)| d.same(r) && ctx.sha(r).as_deref() == Some(s.as_str()))
         };
         // the mod whose DLL is dinput8.dll now, and stays there unless another mod takes its place
-        let holder =
-            (0..n).find(|&i| located[i].as_ref().is_some_and(|l| l.same(&host)) && !dropping(&host, &self.drop));
+        let host_goes = dropping(&host, &self.drop);
+        let holder = (0..n).find(|&i| located[i].as_ref().is_some_and(|l| l.same(&host)) && !host_goes);
         // the mod that hosts now: also one being updated, whose older DLL there goes for the new one
         let current = holder.or_else(|| {
             let (_, _, word) =
@@ -675,19 +675,16 @@ impl<'a> Work<'a> {
         // a loader that refuses every other DLL next to the game must stay dinput8.dll itself
         let package_host = (0..n).find(|&i| ctx.game.package_host(&self.mods[i].word).is_some());
         // a loader that is dinput8.dll now and stays: one dllchain did not install, or its own (the holder)
-        let loader_stays = self.scan.loader().is_some() && !dropping(&host, &self.drop);
+        let loader_here = self.scan.loader().is_some();
+        let loader_stays = loader_here && !host_goes;
         // a loader on dllchain's list (being installed, or updated) hosts, and the others are its guests
         let loader_mod = (0..n).filter(|&i| is_loader[i]).max_by_key(|&i| self.mods[i].order);
         // a loader that goes gives dinput8.dll back to the mod it took it from, which it listed first
-        let first_listed = || {
-            let parsed = self.scan.chain.as_ref()?.parse(ctx.game.host_dll);
-            (0..n)
-                .filter(|&i| can_host[i])
-                .filter_map(|i| Some((i, parsed.find(located[i].as_ref()?)?.line)))
-                .min_by_key(|&(_, line)| line)
-                .map(|(i, _)| i)
-        };
-        let loader_goes = self.scan.loader().is_some() && !loader_stays;
+        let first_listed = (0..n)
+            .filter(|&i| loader_here && host_goes && can_host[i])
+            .filter_map(|i| Some((i, self.scan.parsed.find(located[i].as_ref()?)?.line)))
+            .min_by_key(|&(_, line)| line)
+            .map(|(i, _)| i);
         let host_i = if loader_stays || n == 0 {
             holder.filter(|_| loader_stays)
         } else if loader_mod.is_some() {
@@ -698,8 +695,8 @@ impl<'a> Work<'a> {
             package_host
         } else if let Some(h) = current.filter(|&h| can_host[h]) {
             Some(h)
-        } else if let Some(h) = first_listed().filter(|_| loader_goes) {
-            Some(h)
+        } else if first_listed.is_some() {
+            first_listed
         } else if let Some(h) = (0..n).filter(|&i| can_host[i]).max_by_key(|&i| self.mods[i].order) {
             Some(h)
         } else if self.allow_no_host {
@@ -1183,33 +1180,22 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
 /// Whether dllchain may install the loader `l` (its DLL is `src`) as the host: only one the game's table says it
 /// installs, and never over another loader or next to a loader that runs mods from folders of their own.
 fn check_loader_install(ctx: &Ctx, scan: &Scan, src: &ModSource, l: &Loader) -> Result<()> {
+    let (label, name, host) = (&src.label, l.name, ctx.game.host_dll);
     if let Some(how) = l.install {
         fail!(
-            "{} is {}, a loader for other mods, not a mod: {how}. Once it is in, dllchain adds the mods you install to its list.",
-            src.label,
-            l.name
+            "{label} is {name}, a loader for other mods, not a mod: {how}. Once it is in, dllchain adds the mods you install to its list."
         );
     }
-    let host = ctx.game.host_dll;
     if let Some(ph) = package_host(ctx, scan) {
+        let (ph_name, dir) = (ctx.game.display(ph.word), ph.dir);
         fail!(
-            "{} is {}, a loader for other mods, and {} runs your mods from {}\\<mod>\\ as {host}: only one of them can be {host}. Take {} out first if you want {} instead.",
-            src.label,
-            l.name,
-            ctx.game.display(ph.word),
-            ph.dir,
-            ctx.game.display(ph.word),
-            l.name
+            "{label} is {name}, a loader for other mods, and {ph_name} runs your mods from {dir}\\<mod>\\ as {host}: only one of them can be {host}. Take {ph_name} out first if you want {name} instead."
         );
     }
     if let Some(other) = scan.loader().filter(|o| o.word != l.word) {
+        let other = other.name;
         fail!(
-            "{} is {}, a loader for other mods, and {host} is already {}, another one. dllchain never replaces one loader with another: remove {} yourself first if you want {} instead.",
-            src.label,
-            l.name,
-            other.name,
-            other.name,
-            l.name
+            "{label} is {name}, a loader for other mods, and {host} is already {other}, another one. dllchain never replaces one loader with another: remove {other} yourself first if you want {name} instead."
         );
     }
     Ok(())
