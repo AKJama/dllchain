@@ -656,7 +656,8 @@ impl<'a> Work<'a> {
         // a loader that refuses every other DLL next to the game must stay dinput8.dll itself
         let package_host = (0..n).find(|&i| ctx.game.package_host(&self.mods[i].word).is_some());
         let host_i = if loader_hosts || n == 0 {
-            None
+            // a loader an older dllchain installed as a mod is the holder, and stays dinput8.dll
+            holder.filter(|_| loader_hosts)
         } else if n == 1 {
             Some(0)
         } else if package_host.is_some() {
@@ -2992,8 +2993,8 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         }
     };
     let list = &scan.list;
+    let can = scan.host.as_ref().is_some_and(|(_, i)| i.can_host);
     if ctx.exists(&host) {
-        let can = scan.host.as_ref().map(|(_, i)| i.can_host).unwrap_or(false);
         let role = match scan.loader {
             Some(_) => format!("game loads it; loads the mods in {list}"),
             None if can => "game loads it; starts others".into(),
@@ -3007,8 +3008,10 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             (true, true) => format!("started by {starter}"),
             (false, true) => "switched off".to_string(),
             (true, false) => "listed, but missing".to_string(),
-            // a switched-off line for a file that is not there (such as an example in the file as its loader ships)
-            (false, false) => continue,
+            // a switched-off line for a file that is not there and not dllchain's (such as an example in the file as
+            // its loader ships)
+            (false, false) if !scan.record.mods.iter().any(|m| m.dll_at.same(&e.name)) => continue,
+            (false, false) => "switched off".to_string(),
         };
         st.rows.push(row(&e.name, role, None));
     }
@@ -3017,15 +3020,22 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     }
     if let Some(target) = scan.chain.as_ref().and_then(|c| c.forward().map(|v| (v, c.format.forward))) {
         let (value, (section, key)) = target;
-        if !RelPath::parse(&value).is_ok_and(|r| ctx.exists(&r)) {
+        // a path outside the game folder is the loader's business: only a missing file in it is noted
+        if RelPath::parse(&value).is_ok_and(|r| !ctx.exists(&r)) {
             st.notes.push(format!(
                 "The {key}= line in [{section}] of {list} names {value}, which is not in the game folder: change or remove that line."
             ));
         }
     }
     // Multi DLL Installer renames each mod to dinput9.dll, dinput10.dll and so on; whatever is dinput8.dll loads them
-    let renamed: Vec<String> =
-        (9..=40).map(|k| format!("dinput{k}.dll")).filter(|n| ctx.exists(&RelPath::of(n))).collect();
+    // (an older dllchain could name a mod so: those are its own)
+    let renamed: Vec<String> = (9..=40)
+        .map(|k| format!("dinput{k}.dll"))
+        .filter(|n| {
+            let rel = RelPath::of(n);
+            ctx.exists(&rel) && !scan.record.mods.iter().any(|m| m.dll_at.same(&rel))
+        })
+        .collect();
     if !renamed.is_empty() {
         st.notes.push(format!(
             "{} look like mods Multi DLL Installer renamed. dllchain leaves them as they are and never gives a mod such a name.",
@@ -3069,7 +3079,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     st.host = match (&st.package_host, scan.loader, host_row) {
         (Some((name, dir)), _, _) => Some(format!("{name} loads the mods from {dir}\\<mod>\\.")),
         (None, Some(l), _) => Some(format!("{} loads the chain ({list}).", l.name)),
-        (None, None, Some(name)) if scan.parsed.on().next().is_some() => {
+        (None, None, Some(name)) if can && scan.parsed.on().next().is_some() => {
             Some(format!("{name} loads the chain ({list})."))
         }
         _ => None,

@@ -208,12 +208,19 @@ mod tests {
         let alp_xhl = inspect(&fake_dll(&["auto-loot-plus", "dinput8-chain.ini", "XHL-Core"], None), &ENSHROUDED);
         assert!(alp_xhl.unwrap().loader.is_none());
 
-        // ModLoader Proxy, by its log's name or the ini it reads (both UTF-16 in its DLL)
+        // ModLoader Proxy, by its log's name and the ini it reads (both UTF-16 in its DLL)
+        let utf16 = |t: &str| t.encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>();
         let mut mlp = fake_dll(&[], None);
-        mlp.extend("chainloader.ini".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        mlp.extend(utf16("chainloader.ini"));
+        mlp.extend(utf16("modloader-proxy.log"));
         let mlp = inspect(&mlp, &ENSHROUDED).unwrap();
         assert_eq!(mlp.loader.map(|l| l.list), Some("chainloader.ini"));
         assert_eq!(mlp.word.unwrap().0, "modloader-proxy");
+        // a mod that only mentions chainloader.ini, or says "XHL" without XHL-Core, stays a mod
+        let alp_mlp = inspect(&fake_dll(&["auto-loot-plus", "chainloader.ini"], None), &ENSHROUDED).unwrap();
+        assert!(alp_mlp.loader.is_none());
+        let some_xhl = inspect(&fake_dll(&["dinput8-chain.ini", "xhl"], Some("Shiny Mod")), &ENSHROUDED).unwrap();
+        assert!(some_xhl.loader.is_none() && some_xhl.can_host);
 
         let ms = inspect(&fake_dll(&[], Some("Microsoft Windows Operating System")), &ENSHROUDED).unwrap();
         assert_eq!(ms.word, None);

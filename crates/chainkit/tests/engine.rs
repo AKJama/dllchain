@@ -2077,6 +2077,36 @@ fn removing_the_mod_a_forward_names_is_said_and_the_line_stays() {
 }
 
 #[test]
+fn status_says_who_loads_the_chain_only_when_someone_does() {
+    // a forward outside the game folder is the loader's business
+    let dir = game("status-host");
+    put(&dir, "dinput8.dll", &xhl_core());
+    put(&dir, "dinput8-chain.ini", b"[Chain]\r\n[Options]\r\nForward=C:\\Tools\\real.dll\r\n");
+    let c = ctx(&dir);
+    assert!(status(&c).unwrap().notes.iter().all(|n| !n.contains("Forward=")));
+    // a dinput8.dll that starts no others loads no chain, whatever the chain file says
+    put(&dir, "dinput8.dll", &other());
+    put(&dir, "dinput8-chain.ini", b"[Chain]\r\nhand.dll\r\n");
+    put(&dir, "hand.dll", &xhl());
+    let st = status(&c).unwrap();
+    assert_eq!(st.host, None);
+    assert_eq!(st.rows[0].role, "game loads it; starts no others");
+}
+
+#[test]
+fn a_switched_off_mod_of_dllchains_that_went_missing_still_shows() {
+    let dir = game("off-missing");
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    install(&c, &src("xhl.zip", xhl(), &[]));
+    put(&dir, "dinput8-chain.ini", b"[Chain]\r\n; xhl-core.dll\r\n; Example.dll\r\n");
+    std::fs::remove_file(dir.join("xhl-core.dll")).unwrap();
+    let st = status(&c).unwrap();
+    assert!(st.rows.iter().any(|r| r.file.as_str() == "xhl-core.dll" && r.role == "switched off"), "{:?}", st.rows);
+    assert!(st.rows.iter().all(|r| r.file.as_str() != "Example.dll"));
+}
+
+#[test]
 fn shroudforge_leaves_the_chain_file_and_its_forward_alone() {
     let dir = game("sf-forward");
     shroudforge(&dir);

@@ -159,26 +159,32 @@ pub static ENSHROUDED: Game = Game {
             own_texts: true,
         },
         // XHL-Core began dinput8-chain.ini. Its page (Nexus mod 236) could not be read here, so this is a guess from
-        // what it is: a DLL that reads the chain file and says XHL.
+        // what it is: a DLL that reads the chain file and names XHL-Core (not just "XHL", which any x64 code holds).
         Loader {
             word: "xhl-core",
             name: "XHL-Core",
-            texts: &[&["dinput8-chain.ini", "XHL"]],
+            texts: &[
+                &["dinput8-chain.ini", "XHL-Core"],
+                &["dinput8-chain.ini", "XHL Core"],
+                &["dinput8-chain.ini", "XHLCore"],
+                &["dinput8-chain.ini", "XHL_Core"],
+            ],
             list: "dinput8-chain.ini",
             format: CHAIN,
             install: "put it in the game folder as its page says",
             own_texts: false,
         },
         // ModLoader Proxy (github.com/Entrodor/modloader-proxy, src/main.cpp read 2026-11-07) reads chainloader.ini
-        // next to it, whatever name it was given; dllchain follows it when that name is dinput8.dll.
+        // next to it, whatever name it was given, and logs to modloader-proxy.log; dllchain follows it when that name is
+        // dinput8.dll. Both texts, so a mod that only mentions chainloader.ini stays a mod.
         Loader {
             word: "modloader-proxy",
             name: "ModLoader Proxy",
-            texts: &[&["modloader-proxy"], &["chainloader.ini"]],
+            texts: &[&["modloader-proxy", "chainloader.ini"]],
             list: "chainloader.ini",
             format: LOAD,
             install: "rename it and put it in the game folder as its page says",
-            own_texts: true,
+            own_texts: false,
         },
     ],
     // The lines after auto-loot-plus are EMF's known_tools.txt (MIT, Copyright (c) 2026 EMF contributors; see
