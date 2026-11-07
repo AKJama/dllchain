@@ -1758,3 +1758,95 @@ fn a_loader_mod_and_a_chained_mod_keep_their_names_apart() {
     let e = plan_install(&c, &src("town-portal.zip", fake_dll(&[], None), &[])).unwrap_err();
     assert!(e.0.contains("is on dllchain's list as a mod that brings its own loader (dbgcore.dll)"), "{}", e.0);
 }
+
+#[test]
+fn an_update_of_a_mod_whose_dll_is_its_loader_takes_the_new_dll() {
+    let dir = game("own-update");
+    let c = ctx(&dir);
+    // no version information at all, so nothing says which is newer
+    let v1 = own("Plain.zip", "winmm.dll", fake_dll(&["one"], None), &[(r"Plain\a.txt", b"1")], Some("plain"));
+    let v2 = own("Plain.zip", "winmm.dll", fake_dll(&["two"], None), &[(r"Plain\a.txt", b"2")], Some("plain"));
+    install(&c, &v1);
+    let p = install(&c, &v2);
+    assert_eq!(p.summary[0], "Mod plain will be updated to the new version.", "{:?}", p.summary);
+    assert_eq!(read(&dir, "winmm.dll"), Some(fake_dll(&["two"], None)));
+    assert_eq!(read(&dir, r"Plain\a.txt"), Some(b"2".to_vec()));
+    run(&c, plan_uninstall(&c, Some("plain")));
+    assert!(!dir.join("winmm.dll").exists() && !dir.join("Plain").exists());
+}
+
+#[test]
+fn a_loader_left_by_another_mod_does_not_make_this_one_a_hand_install() {
+    let dir = game("own-left-loader");
+    std::fs::write(dir.join("dbgcore.dll"), greeneye("1.2.2")).unwrap();
+    let c = ctx(&dir);
+    let p = install(&c, &town_portal(greeneye("1.2.2")));
+    assert_eq!(p.summary[0], "Mod town-portal will be added to your game.", "{:?}", p.summary);
+    assert!(p.summary.iter().any(|l| l.starts_with("Finds dbgcore.dll, its loader")), "{:?}", p.summary);
+    // it needs that loader as much as its own files: a repair says when it is gone
+    std::fs::remove_file(dir.join("dbgcore.dll")).unwrap();
+    let p = plan_repair(&c).unwrap();
+    assert!(
+        p.notes.iter().any(|n| n == "dbgcore.dll of Mod town-portal is missing. Install it again to put it back"),
+        "{:?}",
+        p.notes
+    );
+}
+
+#[test]
+fn what_a_loader_mod_made_leaves_a_hand_installed_mod_beside_it_alone() {
+    let dir = game("own-made-beside");
+    let c = ctx(&dir);
+    let tp = own(
+        "Town Portals.zip",
+        "dbgcore.dll",
+        greeneye("1.2.2"),
+        &[(r"greeneye\loader.ini", b"l"), (r"greeneye\town-portal\town-portal.dll", b"tp")],
+        Some("town-portal"),
+    );
+    install(&c, &tp);
+    for (rel, b) in [
+        (r"greeneye\other-mod\config.json", &b"{}"[..]),
+        (r"greeneye\logs\loader.log", b"log"),
+        (r"greeneye\loader.log", b"log"),
+    ] {
+        std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(rel), b).unwrap();
+    }
+    let p = plan_uninstall_with(&c, Some("town-portal"), true).unwrap();
+    assert_eq!(made_names(&p), [r"greeneye\loader.log", r"greeneye\logs\"]);
+    run(&c, Ok(p));
+    assert_eq!(read(&dir, r"greeneye\other-mod\config.json"), Some(b"{}".to_vec()));
+}
+
+#[test]
+fn a_file_another_mod_found_already_there_is_not_this_ones() {
+    let dir = game("own-found-clash");
+    std::fs::create_dir_all(dir.join(r"greeneye\town-portal")).unwrap();
+    std::fs::write(dir.join(r"greeneye\town-portal\mod.json"), b"{}").unwrap();
+    let c = ctx(&dir);
+    install(&c, &town_portal(greeneye("1.2.2")));
+    let clash = own(
+        "Clash.zip",
+        "winmm.dll",
+        fake_dll(&["c"], None),
+        &[(r"greeneye\town-portal\mod.json", b"x")],
+        Some("clash"),
+    );
+    let e = plan_install(&c, &clash).unwrap_err();
+    assert!(e.0.contains(r"greeneye\town-portal\mod.json belongs to another mod on dllchain's list"), "{}", e.0);
+}
+
+#[test]
+fn the_same_zip_again_keeps_when_the_mod_was_installed() {
+    let dir = game("same-zip-again");
+    let c = ctx(&dir);
+    install(&c, &src("xhl.zip", xhl(), &[]));
+    // installed a while ago
+    let rec = dir.join(r"dllchain\record.txt");
+    let text = String::from_utf8(std::fs::read(&rec).unwrap()).unwrap();
+    let at = text.split('\t').find(|f| f.starts_with("20") && f.contains(':')).unwrap().to_string();
+    std::fs::write(&rec, text.replace(&at, "2020-01-01 00:00:00")).unwrap();
+    let p = plan_install(&c, &src("xhl.zip", xhl(), &[])).unwrap();
+    assert!(p.is_empty(), "{:?} {:?}", p.summary, p.files);
+}

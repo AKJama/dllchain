@@ -172,7 +172,7 @@ fn from_entries(
     picked: Option<&str>,
 ) -> Result<ModSource> {
     let host = game.host_dll;
-    let server = server_side(&entries);
+    let server = server_side(&entries, game);
     let mut notes = Vec::new();
     if !server.is_empty() {
         let (client, srv) = CLIENT_SERVER;
@@ -261,9 +261,10 @@ fn from_entries(
 
 type Entries = [(RelPath, Vec<u8>)];
 
-/// The entries in the `server` folder of a zip that has a `client` folder beside it: a mod with a dedicated-server
-/// part, whose client part is the mod.
-fn server_side(entries: &Entries) -> HashSet<usize> {
+/// The entries in the `server` folder of a zip that has a `client` folder beside it with the mod's DLL right in it: a
+/// mod with a dedicated-server part, whose client part is the mod. Folders of those names further down, in the mod's
+/// own folders, are just its files.
+fn server_side(entries: &Entries, game: &Game) -> HashSet<usize> {
     let (client, server) = CLIENT_SERVER;
     // the folders, as `<parent>` lowercased, that hold a folder called `name` on the way to `rel`
     let holders = |rel: &RelPath, name: &str| -> Vec<String> {
@@ -273,7 +274,15 @@ fn server_side(entries: &Entries) -> HashSet<usize> {
             .map(|k| parts[..k].join("\\").to_lowercase())
             .collect()
     };
-    let clients: HashSet<String> = entries.iter().flat_map(|(r, _)| holders(r, client)).collect();
+    let loader = |n: &str| n.eq_ignore_ascii_case(game.host_dll) || game.is_own_loader_name(n);
+    let clients: HashSet<String> = entries
+        .iter()
+        .filter(|(r, _)| loader(r.file_name()))
+        .filter_map(|(r, _)| {
+            let dir = r.parent()?;
+            dir.file_name().eq_ignore_ascii_case(client).then(|| dir.parent().map_or(String::new(), |p| p.key()))
+        })
+        .collect();
     (0..entries.len()).filter(|&i| holders(&entries[i].0, server).iter().any(|p| clients.contains(p))).collect()
 }
 
@@ -1047,6 +1056,12 @@ mod own_loader_tests {
         make_zip(&p, &[("winmm.dll", &dll), ("powrprof.dll", &dll)]);
         let e = read(&p, &ENSHROUDED).unwrap_err();
         assert!(e.0.contains("has 2 DLLs the game would load (winmm.dll, powrprof.dll)"), "{e}");
+        // folders called client and server inside a mod's own folders are just its files
+        let p = tmp("data-folders.zip");
+        make_zip(&p, &[("dinput8.dll", &dll), ("mods/foo/client/ui.cfg", b"u"), ("mods/foo/server/rules.cfg", b"r")]);
+        let s = read(&p, &ENSHROUDED).unwrap();
+        assert_eq!(s.files.len(), 2, "{:?}", s.files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>());
+        assert!(s.notes.is_empty(), "{:?}", s.notes);
         // a loader deeper than another is not a second one: the top one is the mod's, and the deeper one a file
         let p = tmp("deeper.zip");
         make_zip(&p, &[("powrprof.dll", &dll), ("AutoDoors/bin/winmm.dll", &dll)]);

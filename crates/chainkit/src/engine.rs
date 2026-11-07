@@ -1032,8 +1032,10 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     if replaced_now.is_some() {
         rec.replaced_dll = replaced_now;
     }
+    let kept_at = prev.filter(|_| rec.source_sha == src.sha256).map(|_| rec.at.clone());
     fill_source(&mut rec, src, &info);
 
+    let steps_before = w.plan.steps.len();
     let before = w.plan.summary.len();
     retire(&mut w, &mut rec, None, &src.files, None)?;
     plan_files(&mut w, &mut rec, &src.files, &src.label, src.files.is_empty(), &|_| false, NOT_IN_NEW)?;
@@ -1042,7 +1044,7 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     } else {
         w.mods.push(rec);
     }
-    w.dlls.insert(word, src.dll.clone());
+    w.dlls.insert(word.clone(), src.dll.clone());
     // the DLLs first, then the mod's other files
     let file_lines = w.plan.summary.split_off(before);
     w.layout()?;
@@ -1053,6 +1055,14 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
         w.plan.summary.insert(0, l);
     }
     w.plan.summary.extend(file_lines);
+    // the same zip again changes nothing, not even when it was installed
+    if let Some(at) = kept_at {
+        if !w.plan.steps[steps_before..].iter().any(|s| !matches!(s, Step::Write(r, _) if is_own(r))) {
+            if let Some(m) = w.plan.record.mods.iter_mut().find(|m| m.word == word) {
+                m.at = at;
+            }
+        }
+    }
     source_notes(&mut w, src);
     let files: Vec<&RelPath> = src.files.iter().map(|(r, _)| r).collect();
     w.plan.missing = missing(ctx, &scan, &files);
@@ -1404,6 +1414,9 @@ fn plan_install_own_loader(ctx: &Ctx, scan: &Scan, src: &ModSource, info: &DllIn
                 game.chain_file
             ));
             keep = Some((FileRec { rel: loader.clone(), sha: new_sha.clone(), backup }, false));
+            for m in w.loaders.iter_mut().filter(|m| m.dll_at.same(&loader)) {
+                m.dll_sha = new_sha.clone();
+            }
             new_sha
         }
         Some(now) if sha256_hex(&now) == new_sha => {
@@ -1421,9 +1434,12 @@ fn plan_install_own_loader(ctx: &Ctx, scan: &Scan, src: &ModSource, info: &DllIn
         }
         Some(now) => {
             let now_sha = sha256_hex(&now);
+            // dllchain put it there for this mod alone: the zip's is the one it runs on, whatever its version
+            let only_mine = matches!(&mine, Some((f, false)) if f.sha == now_sha)
+                && !w.loaders.iter().any(|o| o.dll_at.same(&loader));
             let theirs = inspect(&now, game).map_err(|e| Error(format!("{loader} in the game folder is {e}")))?;
             let same_tool = matches!((&theirs.word, &info.word), (Some(a), Some(b)) if a.0 == b.0);
-            if !same_tool {
+            if !same_tool && !only_mine {
                 fail!(
                     "{loader} in your game is {}, not the loader {display} brings ({}). Only one {loader} can be next to the game, so dllchain changes nothing. If you no longer use what put it there, remove it first.",
                     theirs.product_name.clone().unwrap_or_else(|| family(&theirs)),
@@ -1432,7 +1448,7 @@ fn plan_install_own_loader(ctx: &Ctx, scan: &Scan, src: &ModSource, info: &DllIn
             }
             let tool = family(info);
             let (v_new, v_now) = (info.version.clone().unwrap_or_default(), theirs.version.clone().unwrap_or_default());
-            if newer_version(&v_new, &v_now) {
+            if only_mine || newer_version(&v_new, &v_now) {
                 let had = mine.or_else(|| holder.and_then(|h| take_listed(&mut w.loaders[h], &loader)));
                 let backup = match had {
                     // dllchain's own copy: what was there before it stays the one Uninstall puts back
@@ -1454,9 +1470,13 @@ fn plan_install_own_loader(ctx: &Ctx, scan: &Scan, src: &ModSource, info: &DllIn
                 };
                 w.plan.steps.push(Step::Write(loader.clone(), src.dll.clone()));
                 w.plan.expect_files.push((loader.clone(), Some(new_sha.clone())));
-                w.plan.summary.push(format!(
-                    "Updates {loader}, the {tool} in your game, from {v_now} to {v_new}: {display} needs the newer one."
-                ));
+                w.plan.summary.push(if only_mine {
+                    format!("Updates {loader} to the one in the zip.")
+                } else {
+                    format!(
+                        "Updates {loader}, the {tool} in your game, from {v_now} to {v_new}: {display} needs the newer one."
+                    )
+                });
                 if backup.is_some() {
                     w.plan.summary.push("dllchain keeps the older one, and Uninstall puts it back.".into());
                 }
@@ -1513,7 +1533,8 @@ fn plan_install_own_loader(ctx: &Ctx, scan: &Scan, src: &ModSource, info: &DllIn
             None
         }
         Some(_) => Some(format!("{display} will be updated to the new version.")),
-        None if !rec.found.is_empty() => {
+        // its own files there already, not only a loader another mod left
+        None if rec.found.iter().any(|f| !f.rel.same(&loader) || src.files.is_empty()) => {
             Some(format!("{display} is already in your game, put there by hand: dllchain lists it from now on."))
         }
         None => Some(format!("{display} will be added to your game.")),
@@ -1649,8 +1670,7 @@ fn plan_files(
     let was_found = |rel: &RelPath| prev_found.iter().any(|f| f.rel.same(rel));
     for (rel, bytes) in src_files {
         check_target(rel, ctx.game)?;
-        if others.iter().any(|m| m.files.iter().any(|f| f.rel.same(rel)) || m.dll_at.same(rel)) || rel.same(&ctx.host())
-        {
+        if others.iter().any(|m| lists(m, rel) || m.dll_at.same(rel)) || rel.same(&ctx.host()) {
             fail!("{label}: {rel} belongs to another mod on dllchain's list");
         }
         resolve(&ctx.dir, rel)?;
@@ -1946,15 +1966,19 @@ pub fn plan_repair(ctx: &Ctx) -> Result<Plan> {
             ));
         }
     }
-    for m in w.mods.iter().chain(&w.packages).chain(&w.loaders) {
-        let missing: Vec<&RelPath> = m.files.iter().map(|f| &f.rel).filter(|r| !ctx.exists(r)).collect();
+    let mut notes = Vec::new();
+    for m in w.all() {
+        // the files it lists, and those that were there already, which it needs as much
+        let missing: Vec<&RelPath> =
+            m.files.iter().chain(&m.found).map(|f| &f.rel).filter(|r| !ctx.exists(r)).collect();
         let name = name_of(ctx.game, m);
         match missing.len() {
             0 => {}
-            1 => w.plan.notes.push(format!("{} of {name} is missing. Install it again to put it back", missing[0])),
-            k => w.plan.notes.push(format!("{k} files of {name} are missing. Install it again to put them back")),
+            1 => notes.push(format!("{} of {name} is missing. Install it again to put it back", missing[0])),
+            k => notes.push(format!("{k} files of {name} are missing. Install it again to put them back")),
         }
     }
+    w.plan.notes.extend(notes);
     Ok(w.finish())
 }
 
@@ -2410,9 +2434,11 @@ fn made_in_own_folders(
                 Some((rel, is_dir))
             })
             .collect();
+        // a folder of someone else's (a mod put in by hand beside this one) is never the mod's; a folder of logs is
+        let foreign = |r: &RelPath| !ours_in(r) && !is_runtime_folder(r);
         // a folder the mod's files are only further down in, beside someone else's folder: theirs too
         let holds = mine.iter().any(|r| r.parent().is_some_and(|p| p.same(d)));
-        if !holds && entries.iter().any(|(r, is_dir)| *is_dir && !ours_in(r)) {
+        if !holds && entries.iter().any(|(r, is_dir)| *is_dir && foreign(r)) {
             continue;
         }
         for (rel, is_dir) in entries {
@@ -2423,7 +2449,7 @@ fn made_in_own_folders(
                 if deletable(&rel) {
                     out.push(Made { rel: rel.clone(), is_dir: false, files: vec![rel], dirs: Vec::new() });
                 }
-            } else if !ours_in(&rel) && !installed(&rel) && deletable(&rel) {
+            } else if !ours_in(&rel) && is_runtime_folder(&rel) && !installed(&rel) && deletable(&rel) {
                 let (mut files, mut dirs) = (Vec::new(), Vec::new());
                 walk_made(ctx, &rel, deletable, &mut files, &mut dirs);
                 if !files.is_empty() {
@@ -2432,6 +2458,12 @@ fn made_in_own_folders(
             }
         }
     }
+}
+
+/// A folder a mod writes into while it runs, by its name: `logs\`, `cache\`, `crash_dumps\`, `backups\`.
+fn is_runtime_folder(rel: &RelPath) -> bool {
+    let name = rel.file_name().to_ascii_lowercase();
+    ["log", "cache", "crash", "dump", "backup", "temp", "tmp"].iter().any(|w| name.contains(w))
 }
 
 /// The files in `dir` (and its folders) that `deletable` allows, and its folders, deepest first, `dir` last. A link
