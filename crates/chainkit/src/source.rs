@@ -11,7 +11,7 @@ use crate::game::Game;
 use crate::hash::{is_sha256, sha256_hex};
 use crate::paths::{RelPath, slug};
 use crate::{OWN_DIR, Result, fail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -336,6 +336,7 @@ fn check_sums(entries: &Entries, server: &HashSet<usize>, installed: &dyn Fn(&Re
     let mut lists = Vec::new();
     let mut notes = Vec::new();
     let mut matched = 0;
+    let index: HashMap<String, usize> = entries.iter().enumerate().rev().map(|(i, (r, _))| (r.key(), i)).collect();
     for (list, data) in entries.iter().filter(|(r, _)| is_checksum_list(r)) {
         let Some(lines) = checksum_lines(list, data) else {
             notes.push(format!(
@@ -347,7 +348,7 @@ fn check_sums(entries: &Entries, server: &HashSet<usize>, installed: &dyn Fn(&Re
             if !installed(&rel) {
                 continue;
             }
-            match entries.iter().position(|(r, _)| r.same(&rel)) {
+            match index.get(&rel.key()).copied() {
                 Some(i) if server.contains(&i) => {}
                 Some(i) if sha256_hex(&entries[i].1) != hash => {
                     fail!(
@@ -675,7 +676,7 @@ mod tests {
         z.finish().unwrap();
     }
 
-    fn tmp(name: &str) -> std::path::PathBuf {
+    pub fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("chainkit-src-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d.join(name)
@@ -902,16 +903,10 @@ mod tests {
 /// lists.
 #[cfg(test)]
 mod own_loader_tests {
-    use super::tests::make_zip;
+    use super::tests::{make_zip, tmp};
     use super::*;
     use crate::dllinfo::{fake_dll, fake_dll_with};
     use crate::game::ENSHROUDED;
-
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("chainkit-own-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d.join(name)
-    }
 
     fn greeneye() -> Vec<u8> {
         fake_dll_with(&["greeneye"], &[("ProductName", "Greeneye Loader"), ("ProductVersion", "1.2.2")])

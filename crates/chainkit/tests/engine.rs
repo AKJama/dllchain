@@ -109,6 +109,12 @@ fn install(c: &Ctx, s: &ModSource) -> Plan {
     run(c, plan_install(c, s))
 }
 
+/// Writes a file into the game folder, with its folders.
+fn put(dir: &Path, rel: &str, bytes: &[u8]) {
+    std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+    std::fs::write(dir.join(rel), bytes).unwrap();
+}
+
 fn read(dir: &Path, rel: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.join(rel)).ok()
 }
@@ -1618,14 +1624,12 @@ fn a_hand_installed_mod_is_taken_on_and_given_back_as_it_was() {
         (r"greeneye\town-portal\town-portal.ini", b"my settings"),
         (r"greeneye\loader.log", b"log"),
     ] {
-        std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
-        std::fs::write(dir.join(rel), b).unwrap();
+        put(&dir, rel, b);
     }
     let ad = auto_doors();
     std::fs::write(dir.join("powrprof.dll"), &ad.dll).unwrap();
     for (rel, b) in &ad.files {
-        std::fs::create_dir_all(dir.join(rel.as_str()).parent().unwrap()).unwrap();
-        std::fs::write(dir.join(rel.as_str()), b).unwrap();
+        put(&dir, rel.as_str(), b);
     }
     let before = snapshot(&dir);
     let p = install(&c, &town_portal(greeneye("1.2.2")));
@@ -1807,11 +1811,11 @@ fn what_a_loader_mod_made_leaves_a_hand_installed_mod_beside_it_alone() {
     install(&c, &tp);
     for (rel, b) in [
         (r"greeneye\other-mod\config.json", &b"{}"[..]),
+        (r"greeneye\catalog\list.txt", b"c"),
         (r"greeneye\logs\loader.log", b"log"),
         (r"greeneye\loader.log", b"log"),
     ] {
-        std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
-        std::fs::write(dir.join(rel), b).unwrap();
+        put(&dir, rel, b);
     }
     let p = plan_uninstall_with(&c, Some("town-portal"), true).unwrap();
     assert_eq!(made_names(&p), [r"greeneye\loader.log", r"greeneye\logs\"]);

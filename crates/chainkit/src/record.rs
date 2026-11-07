@@ -62,6 +62,30 @@ pub struct ModRec {
     pub dirs: Vec<RelPath>,
 }
 
+impl ModRec {
+    /// A mod at `dll_at` with nothing else known yet.
+    pub fn new(word: String, kind: Kind, order: u32, dll_at: RelPath) -> ModRec {
+        ModRec {
+            word,
+            kind,
+            order,
+            at: String::new(),
+            source_sha: String::new(),
+            label: String::new(),
+            name: None,
+            from_url: None,
+            dll_sha: String::new(),
+            dll_at,
+            replaced_dll: None,
+            version: None,
+            files: Vec::new(),
+            retired: Vec::new(),
+            found: Vec::new(),
+            dirs: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Record {
     pub mods: Vec<ModRec>,
@@ -215,22 +239,10 @@ impl Record {
                 }
                 let source = if *source == "-" { "-".into() } else { sha(source)? };
                 self.mods.push(ModRec {
-                    word: w,
-                    kind,
-                    order: order.parse().map_err(|_| "not a number")?,
                     at: at.to_string(),
                     source_sha: source,
                     label: label.to_string(),
-                    name: None,
-                    from_url: None,
-                    dll_sha: String::new(),
-                    dll_at: RelPath::of("dinput8.dll"),
-                    replaced_dll: None,
-                    version: None,
-                    files: Vec::new(),
-                    retired: Vec::new(),
-                    found: Vec::new(),
-                    dirs: Vec::new(),
+                    ..ModRec::new(w, kind, order.parse().map_err(|_| "not a number")?, RelPath::of("dinput8.dll"))
                 });
             }
             ["dll", w, at, s] => {
