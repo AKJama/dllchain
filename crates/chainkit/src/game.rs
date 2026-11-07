@@ -4,7 +4,8 @@ use crate::chainini::{CHAIN, Format, LOAD};
 use crate::paths::RelPath;
 
 /// A loader that only loads other mods (it is no mod itself). As the host DLL it stays where it is and every mod is a
-/// guest in its list file; dllchain never moves, replaces or deletes it, and never installs it.
+/// guest in its list file. One that dllchain did not install is never moved, replaced or deleted; one whose `install`
+/// is `None`, dllchain installs as the host, and the mod that was the host joins its list.
 #[derive(Debug)]
 pub struct Loader {
     pub word: &'static str,
@@ -14,8 +15,9 @@ pub struct Loader {
     /// The file next to it that lists the mods it loads, and that file's layout.
     pub list: &'static str,
     pub format: Format,
-    /// How players install it, for the refusal when they pick its zip in dllchain.
-    pub install: &'static str,
+    /// How players install it, for the refusal when they pick its zip in dllchain; `None` when dllchain installs it
+    /// (only a loader whose `list` is the game's chain file, so the mods' lines stay where they are).
+    pub install: Option<&'static str>,
     /// Its texts are its own: a DLL that holds them is this loader even when it also names a mod from `tools` (EMF
     /// names the mods it knows). Otherwise a DLL one of `tools` names is that mod, not this loader.
     pub own_texts: bool,
@@ -155,11 +157,13 @@ pub static ENSHROUDED: Game = Game {
             texts: &[&["EMF-LOADER-7d3c9f"], &["emf_probe"]],
             list: "dinput8-chain.ini",
             format: CHAIN,
-            install: "install EMF with its own install.cmd",
+            install: Some("install EMF with its own install.cmd"),
             own_texts: true,
         },
-        // XHL-Core began dinput8-chain.ini. Its page (Nexus mod 236) could not be read here, so this is a guess from
-        // what it is: a DLL that reads the chain file and names XHL-Core (not just "XHL", which any x64 code holds).
+        // XHL-Core began dinput8-chain.ini: a DLL that reads the chain file and names XHL-Core (not just "XHL", which
+        // any x64 code holds). 2.0.6's dinput8.dll (Nexus mod 236, read 2026-11-07) logs "[XHL-Core-Session]" and reads
+        // [Chain] and [Options] Forward= there; its page says to keep it as dinput8.dll and list the mod that was
+        // dinput8.dll before under [Chain], which is what dllchain does when it installs it.
         Loader {
             word: "xhl-core",
             name: "XHL-Core",
@@ -171,7 +175,7 @@ pub static ENSHROUDED: Game = Game {
             ],
             list: "dinput8-chain.ini",
             format: CHAIN,
-            install: "put it in the game folder as its page says",
+            install: None,
             own_texts: false,
         },
         // ModLoader Proxy (github.com/Entrodor/modloader-proxy, src/main.cpp read 2026-11-07) reads chainloader.ini
@@ -183,7 +187,7 @@ pub static ENSHROUDED: Game = Game {
             texts: &[&["modloader-proxy", "chainloader.ini"]],
             list: "chainloader.ini",
             format: LOAD,
-            install: "rename it and put it in the game folder as its page says",
+            install: Some("rename it and put it in the game folder as its page says"),
             own_texts: false,
         },
     ],
@@ -317,6 +321,13 @@ mod tests {
             assert!(!ENSHROUDED.renamed_by_others(s), "{s}");
         }
         assert!(ENSHROUDED.is_list_file("ChainLoader.ini") && !ENSHROUDED.is_list_file("mods.ini"));
+    }
+
+    #[test]
+    fn a_loader_dllchain_installs_reads_the_chain_file() {
+        for l in ENSHROUDED.loaders.iter().filter(|l| l.install.is_none()) {
+            assert!(l.list.eq_ignore_ascii_case(ENSHROUDED.chain_file), "{}", l.name);
+        }
     }
 
     #[test]

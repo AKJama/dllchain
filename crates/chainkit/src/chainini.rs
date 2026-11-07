@@ -325,6 +325,21 @@ impl ChainFile {
         AddResult::Added
     }
 
+    /// Lists `name` before the list's first DLL, so its loader starts it first; with no DLL listed yet, as [`add`]
+    /// does. A line that is already there stays where it is.
+    ///
+    /// [`add`]: ChainFile::add
+    pub fn add_first(&mut self, name: &RelPath, host_dll: &str, switch_on: bool) -> AddResult {
+        let p = self.parse(host_dll);
+        match p.entries.first() {
+            Some(first) if p.find(name).is_none() => {
+                self.insert(first.line, name.to_string());
+                AddResult::Added
+            }
+            _ => self.add(name, host_dll, switch_on),
+        }
+    }
+
     /// Takes every counted line for `name` (on or off) out. Returns whether one was there.
     pub fn remove(&mut self, name: &RelPath) -> bool {
         let mut drop: Vec<usize> = Vec::new();
@@ -545,6 +560,36 @@ mod tests {
         let mut f = ChainFile::decode(b"[Other]\nk=v\n");
         f.add(&RelPath::of("a.dll"), HOST, true);
         assert_eq!(f.lines, vec!["[Other]", "k=v", "", "[Chain]", "a.dll"]);
+    }
+
+    #[test]
+    fn adds_first_before_the_first_dll_and_back() {
+        let shapes: [&[u8]; 3] =
+            [b"[Chain]\r\nenstash.dll\r\n", b"; note\n[Chain]\n; off.dll\nb.dll\n[Options]\nForward=b.dll", b"x.dll"];
+        for bytes in shapes {
+            let mut f = ChainFile::decode(bytes);
+            let first = f.parse(HOST).entries[0].name.to_string();
+            assert_eq!(f.add_first(&RelPath::of("old-host.dll"), HOST, true), AddResult::Added);
+            let got = names(&f);
+            assert_eq!(got[0].0, "old-host.dll");
+            assert_eq!(got[1].0, first);
+            assert_eq!(f.add_first(&RelPath::of("OLD-HOST.dll"), HOST, true), AddResult::AlreadyOn);
+            assert!(f.remove(&RelPath::of("old-host.dll")));
+            assert_eq!(f.encode(), bytes);
+        }
+        assert_eq!(
+            ChainFile::decode(b"[Chain]\r\nenstash.dll\r\n").tap_first("a.dll"),
+            b"[Chain]\r\na.dll\r\nenstash.dll\r\n"
+        );
+        // nothing listed yet: as add does
+        assert_eq!(ChainFile::new().tap_first("a.dll"), b"[Chain]\r\na.dll\r\n");
+    }
+
+    impl ChainFile {
+        fn tap_first(mut self, name: &str) -> Vec<u8> {
+            self.add_first(&RelPath::of(name), HOST, true);
+            self.encode()
+        }
     }
 
     #[test]

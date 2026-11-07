@@ -1,5 +1,41 @@
 # dllchain status
 
+## 2026-11-07: a chain loader that arrives after another host (branch wip/loader-arrives)
+
+XHL-Core's zip can now be installed when another `dinput8.dll` already hosts the chain (Auto Loot Plus, as the user has it), so XHL plugins such as Area Harvest run.
+
+### Rules
+
+- Method 1 (XHL-Core's own page): Core becomes `dinput8.dll`, the old host is renamed (`auto-loot-plus.dll`) and listed first in `dinput8-chain.ini`, so it still starts before the mods it started; the rest of the chain stays.
+- `Loader.install` is `None` only for a loader dllchain installs (XHL-Core); EMF and ModLoader Proxy keep their "install it yourself" refusal.
+  A loader is never installed over another loader or next to ShroudForge.
+- `Forward=` is never written: Auto Loot Plus does all its work in `DllMain` (its source), so it needs no `DirectInput8Create`; Core's "auto" forward picks the first chain entry that exports it.
+- A hand copy of the same Core, identical, is taken on with no file change and stays on uninstall; a newer one replaces it with a copy kept.
+- Updating the old host (an ALP build installed with `install <its dinput8.dll>`) replaces only its chained `auto-loot-plus.dll`; Core stays `dinput8.dll`.
+- Uninstalling Core gives `dinput8.dll` back to the mod listed first that can host, and the chain file comes back byte for byte.
+
+### In the game (rig, enshrouded-chests `mm-xhl-core`, wip/rig-dev 7ab5265)
+
+- Runs 20261107-190826 and 20261107-192230 (after the review fixes): EML and ALP by hand, enstash 0.15.0 with dllchain v0.3.0, then XHL-Core 2.0.6 and XHL-Area-Harvest 2.0.0 with this build; both passed, restore byte-identical.
+- `XHL-Native-Plugin-Host.log`: "role=primary", chain loaded `auto-loot-plus.dll` and `enstash.dll`, "DirectInput8Create is forwarded to auto-loot-plus.dll", "loaded plugin: xhl-area-harvest 2.0.0".
+- `auto-loot-plus.log`: "Patches angewendet"; enstash started as a chained DLL and Quick Stack ran.
+
+### Follow-ups
+
+- Remember the displaced host in the record instead of reading the first chain line on uninstall (simplify's altitude finding); a host that could not start others is not chosen back today.
+- enstash's mod list calls Core "DINPUT8.dll (not a mod enstash knows)": teach enstash XHL-Core.
+- No warning yet that a mod with `mods\<name>\native-plugin.ini` needs XHL-Core.
+
+### Checks
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`: clean.
+- `cargo test --release`: 135 tests (48 chainkit lib, 76 engine, 6 window, 5 command line), rerun after both reviews' fixes.
+
+### Reviews
+
+- `/code-review medium`: 10 findings, 4 fixed (uninstall gives dinput8.dll back to the displaced host, only a loader dllchain installs takes the host's place, no "starts the other mods" line without other mods, one inspect per mod); the rest are refusals that are right, edge cases or existing behaviour.
+- `/simplify`: 16 findings, 13 after dedup, 4 fixed (one parse of the chain via `scan.parsed`, `host_goes` once, `same_tool` simpler, named format captures); the rest skipped, one as the follow-up above.
+
 ## 2026-11-07: other loaders and mod managers (branch wip/other-loaders)
 
 dllchain now keeps everything it does not own in another tool's list file, and adds mods to another loader's list instead of replacing it.

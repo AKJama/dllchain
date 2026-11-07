@@ -1961,11 +1961,196 @@ fn xhl_core_alone_is_left_as_it_is() {
     let st = status(&c).unwrap();
     assert_eq!(st.host.as_deref(), Some("XHL-Core loads the chain (dinput8-chain.ini)."));
     assert!(st.rows[0].details.iter().any(|d| d.1.contains("listed in dinput8-chain.ini, where XHL-Core loads it")));
-    // a loader's own zip is not a mod
-    let e = plan_install(&c, &src("XHL-Core-1.0.zip", xhl_core(), &[])).unwrap_err();
-    assert!(e.0.contains("XHL-Core, a loader for other mods"), "{e}");
+    // a loader dllchain does not install is refused, and so is one over another loader
     let e = plan_install(&c, &src("modloader-proxy.zip", mlp(), &[])).unwrap_err();
     assert!(e.0.contains("ModLoader Proxy, a loader"), "{e}");
+    let e = plan_install(&c, &src("emf.zip", emf(), &[])).unwrap_err();
+    assert!(e.0.contains("install EMF with its own install.cmd"), "{e}");
+    // the same XHL-Core put in by hand is taken on as it is, and stays when it is uninstalled
+    let before = snapshot(&dir);
+    let p = install(&c, &src("XHL-Core-1.0.zip", xhl_core(), &[]));
+    assert!(p.files.is_empty(), "{:?}", p.files);
+    assert!(p.summary.iter().any(|l| l.contains("already in your game, the same file")), "{:?}", p.summary);
+    assert_eq!(status(&c).unwrap().rows[0].source, "XHL-Core-1.0.zip");
+    run(&c, plan_uninstall(&c, Some("xhl-core")));
+    assert_eq!(snapshot(&dir), before);
+    // a newer one replaces it, and Uninstall puts the hand copy back
+    let newer = fake_dll(&["dinput8-chain.ini", "2.0.7"], Some("XHL-Core"));
+    install(&c, &src("XHL-Core-2.0.7.zip", newer.clone(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(newer));
+    run(&c, plan_uninstall(&c, Some("xhl-core")));
+    assert_eq!(snapshot(&dir), before);
+}
+
+/// The game as the player has it: Auto Loot Plus is dinput8.dll and starts enstash; EML is dbghelp.dll.
+fn alp_hosting_enstash(name: &str) -> (PathBuf, Ctx) {
+    let dir = game(name);
+    put(&dir, "dbghelp.dll", &eml());
+    let c = ctx(&dir);
+    install(&c, &src("enstash.zip", enstash(), &[("enstash-README.txt", b"r")]));
+    install(&c, &src("alp.zip", alp(), &[(r"mods\auto-loot-plus\mod.json", b"{}")]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(chain(&dir), vec![("enstash.dll".to_string(), true)]);
+    (dir, c)
+}
+
+fn eml() -> Vec<u8> {
+    fake_dll(&["EML_LOG_FILE_PATH"], None)
+}
+
+/// XHL-Area-Harvest's zip: EML's dbghelp.dll, the same as the player's, and its folder with a native plugin
+/// XHL-Core loads.
+fn area_harvest() -> ModSource {
+    let plugin = fake_dll(&["XhlNativePluginQuery"], None);
+    let ini: &[u8] = b"[Plugin]\r\nEnabled=1\r\nDll=XHL-Area-Harvest.dll\r\n";
+    own(
+        "XHL-Area-Harvest 128 2.0.0.zip",
+        "dbghelp.dll",
+        eml(),
+        &[
+            (r"mods\XHL-Area-Harvest\XHL-Area-Harvest.dll", plugin.as_slice()),
+            (r"mods\XHL-Area-Harvest\native-plugin.ini", ini),
+            (r"mods\XHL-Area-Harvest\mod.json", b"{}"),
+        ],
+        Some("xhl-area-harvest"),
+    )
+}
+
+#[test]
+fn xhl_core_takes_over_from_the_host_which_still_runs_first() {
+    let (dir, c) = alp_hosting_enstash("xhl-arrives");
+    let before = snapshot(&dir);
+    let ini_before = read(&dir, "dinput8-chain.ini").unwrap();
+    let p = install(&c, &src("XHL-Core 236 2.0.6.zip", xhl_core(), &[]));
+    clean(&dir);
+    assert_eq!(
+        p.summary[..3],
+        [
+            "XHL-Core will be added to your game.",
+            "XHL-Core becomes dinput8.dll and starts the other mods from dinput8-chain.ini.",
+            "Auto Loot Plus keeps working."
+        ]
+    );
+    assert!(p.files.contains(&"dinput8.dll renamed to auto-loot-plus.dll".to_string()), "{:?}", p.files);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(xhl_core()));
+    assert_eq!(read(&dir, "auto-loot-plus.dll"), Some(alp()));
+    assert_eq!(read(&dir, "enstash.dll"), Some(enstash()));
+    assert_eq!(read(&dir, "dbghelp.dll"), Some(eml()));
+    // the old host is listed first, so it still starts before the mods it started
+    assert_eq!(read(&dir, "dinput8-chain.ini"), Some(b"[Chain]\r\nauto-loot-plus.dll\r\nenstash.dll\r\n".to_vec()));
+    let st = status(&c).unwrap();
+    assert_eq!(st.host.as_deref(), Some("XHL-Core loads the chain (dinput8-chain.ini)."));
+    assert_eq!((st.rows[0].name.as_str(), st.rows[0].version.as_deref()), ("XHL-Core", Some("2.0.6")));
+    assert!(st.rows[0].installed);
+    assert_eq!(row(&st, "auto-loot-plus").role, "started by XHL-Core");
+    assert!(st.repair.is_empty(), "{:?}", st.repair);
+    // installing it again only checks
+    assert!(plan_install(&c, &src("XHL-Core 236 2.0.6.zip", xhl_core(), &[])).unwrap().is_empty());
+
+    // a new build of the old host replaces its chained copy; XHL-Core stays dinput8.dll
+    let with_core = snapshot(&dir);
+    let p = install(&c, &src("alp.zip", alp2(), &[(r"mods\auto-loot-plus\mod.json", b"{}")]));
+    assert_eq!(p.files, vec!["auto-loot-plus.dll (replaced)"]);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(xhl_core()));
+    assert_eq!(read(&dir, "auto-loot-plus.dll"), Some(alp2()));
+    assert_eq!(chain(&dir), vec![("auto-loot-plus.dll".to_string(), true), ("enstash.dll".to_string(), true)]);
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&with_core));
+
+    // a mod whose plugin XHL-Core loads, next to EML's dbghelp.dll, which it ships the same
+    let p = install(&c, &area_harvest());
+    assert!(p.summary.iter().any(|l| l.contains("Finds dbghelp.dll")), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(xhl_core()));
+    assert!(read(&dir, r"mods\XHL-Area-Harvest\native-plugin.ini").is_some());
+    assert_eq!(chain(&dir).len(), 2);
+    run(&c, plan_uninstall(&c, Some("xhl-area-harvest")));
+    assert_eq!(read(&dir, "dbghelp.dll"), Some(eml()));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&with_core));
+
+    // a copy of the old host put over XHL-Core by hand is chained again by a repair
+    put(&dir, "dinput8.dll", &alp());
+    let p = run(&c, plan_repair(&c));
+    assert!(!p.is_empty());
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&with_core));
+
+    // uninstalling XHL-Core makes the old host dinput8.dll again, and its file is as it was
+    let p = run(&c, plan_uninstall(&c, Some("xhl-core")));
+    assert!(p.summary.iter().any(|l| l == "Deletes dinput8.dll."), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(read(&dir, "dinput8-chain.ini"), Some(ini_before.clone()));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+    // Undo puts XHL-Core back, Undo again takes it out
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&with_core));
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+    // and undoing the install itself gives back the folder byte for byte
+    install(&c, &src("XHL-Core 236 2.0.6.zip", xhl_core(), &[]));
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(read(&dir, "dbghelp.dll"), Some(eml()));
+    assert!(!dir.join("dllchain").exists());
+}
+
+#[test]
+fn uninstalling_xhl_core_gives_dinput8_back_to_the_mod_it_took_it_from() {
+    // Auto Loot Plus came first and stayed the host when enstash, which could host too, came after it
+    let dir = game("xhl-gives-back");
+    put(&dir, "dbghelp.dll", &eml());
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    install(&c, &src("enstash.zip", enstash(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    let before = snapshot(&dir);
+    install(&c, &src("XHL-Core.zip", xhl_core(), &[]));
+    assert_eq!(chain(&dir), vec![("auto-loot-plus.dll".to_string(), true), ("enstash.dll".to_string(), true)]);
+    run(&c, plan_uninstall(&c, Some("xhl-core")));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+}
+
+#[test]
+fn xhl_core_on_its_own_or_with_a_mod_put_in_by_hand() {
+    // no mod yet: it is just dinput8.dll
+    let dir = game("xhl-first");
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let p = install(&c, &src("XHL-Core.zip", xhl_core(), &[]));
+    assert!(!p.summary.iter().any(|l| l.contains("starts the other mods")), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(xhl_core()));
+    assert!(read(&dir, "dinput8-chain.ini").is_none());
+    install(&c, &src("alp.zip", alp(), &[]));
+    assert_eq!(chain(&dir), vec![("auto-loot-plus.dll".to_string(), true)]);
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(snapshot(&dir), before);
+
+    // a dinput8.dll put in by hand joins the chain, first, and comes back on uninstall
+    let dir = game("xhl-over-hand");
+    put(&dir, "dinput8.dll", &shiny());
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let p = install(&c, &src("XHL-Core.zip", xhl_core(), &[]));
+    assert!(p.summary.iter().any(|l| l == "Shiny Mod is already in your game and keeps working."), "{:?}", p.summary);
+    assert_eq!(read(&dir, "shiny-mod.dll"), Some(shiny()));
+    assert_eq!(chain(&dir), vec![("shiny-mod.dll".to_string(), true)]);
+    run(&c, plan_uninstall(&c, Some("xhl-core")));
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn a_loader_is_never_installed_over_another_or_next_to_shroudforge() {
+    let dir = game("xhl-over-emf");
+    put(&dir, "dinput8.dll", &emf());
+    let c = ctx(&dir);
+    let e = plan_install(&c, &src("XHL-Core.zip", xhl_core(), &[])).unwrap_err();
+    assert!(e.0.contains("dinput8.dll is already EMF") && e.0.contains("never replaces one loader"), "{e}");
+
+    let dir = game("xhl-sf");
+    shroudforge(&dir);
+    let c = ctx(&dir);
+    let e = plan_install(&c, &src("XHL-Core.zip", xhl_core(), &[])).unwrap_err();
+    assert!(e.0.contains("only one of them can be dinput8.dll"), "{e}");
 }
 
 #[test]
