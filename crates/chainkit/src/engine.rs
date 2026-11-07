@@ -648,10 +648,15 @@ impl<'a> Work<'a> {
         let ctx = self.ctx;
         let host = ctx.host();
         let n = self.mods.len();
-        let infos: Vec<Option<DllInfo>> =
-            self.mods.iter().map(|m| inspect(&self.dlls[&m.word], ctx.game).ok()).collect();
-        let can_host: Vec<bool> = infos.iter().map(|i| i.as_ref().is_some_and(|i| i.can_host)).collect();
-        let is_loader: Vec<bool> = infos.iter().map(|i| i.as_ref().is_some_and(|i| i.loader.is_some())).collect();
+        // (it can start the others, it is a loader dllchain installs)
+        let (can_host, is_loader): (Vec<bool>, Vec<bool>) = self
+            .mods
+            .iter()
+            .map(|m| {
+                inspect(&self.dlls[&m.word], ctx.game)
+                    .map_or((false, false), |i| (i.can_host, i.loader.is_some_and(|l| l.install.is_none())))
+            })
+            .unzip();
         let located: Vec<Option<RelPath>> = self.mods.iter().map(|m| locate(ctx, self.scan, m)).collect();
         // a DLL of ours that goes before anything moves (only while it is still the one dllchain means)
         let dropping = |r: &RelPath, drop: &[(RelPath, String, String)]| {
@@ -673,6 +678,16 @@ impl<'a> Work<'a> {
         let loader_stays = self.scan.loader().is_some() && !dropping(&host, &self.drop);
         // a loader on dllchain's list (being installed, or updated) hosts, and the others are its guests
         let loader_mod = (0..n).filter(|&i| is_loader[i]).max_by_key(|&i| self.mods[i].order);
+        // a loader that goes gives dinput8.dll back to the mod it took it from, which it listed first
+        let first_listed = || {
+            let parsed = self.scan.chain.as_ref()?.parse(ctx.game.host_dll);
+            (0..n)
+                .filter(|&i| can_host[i])
+                .filter_map(|i| Some((i, parsed.find(located[i].as_ref()?)?.line)))
+                .min_by_key(|&(_, line)| line)
+                .map(|(i, _)| i)
+        };
+        let loader_goes = self.scan.loader().is_some() && !loader_stays;
         let host_i = if loader_stays || n == 0 {
             holder.filter(|_| loader_stays)
         } else if loader_mod.is_some() {
@@ -682,6 +697,8 @@ impl<'a> Work<'a> {
         } else if package_host.is_some() {
             package_host
         } else if let Some(h) = current.filter(|&h| can_host[h]) {
+            Some(h)
+        } else if let Some(h) = first_listed().filter(|_| loader_goes) {
             Some(h)
         } else if let Some(h) = (0..n).filter(|&i| can_host[i]).max_by_key(|&i| self.mods[i].order) {
             Some(h)
@@ -1151,7 +1168,7 @@ pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
         let l = w.plan.summary.remove(i);
         w.plan.summary.insert(0, l);
         // a loader takes over from the mod that was the host
-        if let Some(l) = info.loader.filter(|_| scan.loader().is_none()) {
+        if let Some(l) = info.loader.filter(|_| scan.loader().is_none() && w.mods.len() > 1) {
             let (host, list) = (ctx.game.host_dll, l.list);
             w.plan.summary.insert(1, format!("{display} becomes {host} and starts the other mods from {list}."));
         }

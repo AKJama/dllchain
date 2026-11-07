@@ -2094,12 +2094,30 @@ fn xhl_core_takes_over_from_the_host_which_still_runs_first() {
 }
 
 #[test]
+fn uninstalling_xhl_core_gives_dinput8_back_to_the_mod_it_took_it_from() {
+    // Auto Loot Plus came first and stayed the host when enstash, which could host too, came after it
+    let dir = game("xhl-gives-back");
+    put(&dir, "dbghelp.dll", &eml());
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    install(&c, &src("enstash.zip", enstash(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    let before = snapshot(&dir);
+    install(&c, &src("XHL-Core.zip", xhl_core(), &[]));
+    assert_eq!(chain(&dir), vec![("auto-loot-plus.dll".to_string(), true), ("enstash.dll".to_string(), true)]);
+    run(&c, plan_uninstall(&c, Some("xhl-core")));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+}
+
+#[test]
 fn xhl_core_on_its_own_or_with_a_mod_put_in_by_hand() {
     // no mod yet: it is just dinput8.dll
     let dir = game("xhl-first");
     let before = snapshot(&dir);
     let c = ctx(&dir);
-    install(&c, &src("XHL-Core.zip", xhl_core(), &[]));
+    let p = install(&c, &src("XHL-Core.zip", xhl_core(), &[]));
+    assert!(!p.summary.iter().any(|l| l.contains("starts the other mods")), "{:?}", p.summary);
     assert_eq!(read(&dir, "dinput8.dll"), Some(xhl_core()));
     assert!(read(&dir, "dinput8-chain.ini").is_none());
     install(&c, &src("alp.zip", alp(), &[]));
