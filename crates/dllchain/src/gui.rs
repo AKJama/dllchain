@@ -417,6 +417,9 @@ fn refresh(msg: &str) {
                     if st.rows.is_empty() {
                         text.push_str("No DLL mods yet. Click Install mod... or drop a mod's zip on this window.\n");
                     }
+                    if let Some(h) = &st.host {
+                        text.push_str(&format!("{h}\n"));
+                    }
                     for n in &st.notes {
                         text.push_str(&format!("Note: {n}\n"));
                     }
@@ -428,11 +431,14 @@ fn refresh(msg: &str) {
                     let listed = st.rows.iter().any(|r| r.word.is_some());
                     let by_hand = st.rows.iter().find(|r| r.word.is_none() && r.file.as_str() == GAME.host_dll);
                     if let Some(r) = by_hand.filter(|_| !listed) {
-                        let then = match &st.package_host {
-                            Some((_, dir)) => {
+                        let then = match (&st.package_host, &st.loader) {
+                            (Some((_, dir)), _) => {
                                 format!("a mod you install goes into {dir}\\<mod>\\, where {} loads it", r.name)
                             }
-                            None => "when you install another mod, it joins the chain".to_string(),
+                            (None, Some((_, list))) => {
+                                format!("a mod you install is listed in {list}, where {} loads it", r.name)
+                            }
+                            (None, None) => "when you install another mod, it joins the chain".to_string(),
                         };
                         text.push_str(&format!(
                             "{} is {}, put there by hand or by another tool. dllchain leaves it as it is; {then}.\n",

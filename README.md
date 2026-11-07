@@ -83,7 +83,7 @@ Without `--yes` it only shows what it would do.
 ## What it does to the game folder
 
 - One mod that can start others becomes `dinput8.dll`; every other mod is renamed to `<name>.dll` and listed in `dinput8-chain.ini`.
-- When a mod loader that hosts every mod is installed, it stays `dinput8.dll` and every mod is chained behind it; dllchain never touches the loader's own files.
+- When a loader for other mods is `dinput8.dll` (EMF, XHL-Core, ModLoader Proxy), it stays `dinput8.dll` and every mod is listed in its own list file; dllchain never touches the loader itself (see "Works with").
 - When ShroudForge is installed, it stays `dinput8.dll` and each mod goes into a folder of its own, `mods\<name>\`, where ShroudForge loads it; no chain is used.
   A mod that ships a `native-plugin.ini` (which says which DLL to load), as enstash does, goes into that folder whole.
   A `mod.json` from the zip is left out of that folder, as ShroudForge does not load a native mod from a folder that has one.
@@ -100,7 +100,7 @@ Without `--yes` it only shows what it would do.
   So is a loader that would stop ShroudForge's folders from loading.
   The files such a loader and its mods write while they run (`greeneye\loader.log`, `greeneye\town-portal\town-portal.ini`) count as files the mod made.
 - Files that were already there, the same as in the zip (a mod you put in by hand), are listed but stay yours: Uninstall leaves them, so the folder is as it was before.
-- A `dinput8.dll` that was already there, put in by hand or by another tool, is left as it is until you install another mod; then it joins the chain, and uninstalling gives it back.
+- A `dinput8.dll` that was already there, put in by hand or by another tool, is left as it is until you install another mod; then it joins the chain, and uninstalling gives it back (a loader for other mods stays `dinput8.dll` instead).
 - A file it replaces is copied to `dllchain\originals\` first, and put back on uninstall.
 - What it installed is listed in `dllchain\record.txt`, and each run is logged in `dllchain\installer.log`.
 - When the mod was downloaded with a browser, the website it came from is noted too (Windows keeps that with every download).
@@ -118,6 +118,27 @@ The last finished run is kept in `dllchain\undo.txt`, with copies of what it cha
 
 dllchain does not trust its own record: a mod could have edited it.
 Entries that point at a protected file, outside the game folder, or at anything dllchain could not have made are dropped with a note.
+
+## Works with
+
+dllchain shares the game folder with the other Enshrouded loaders and mod managers.
+Status (and the window) says which one is in charge, in a line such as "XHL-Core loads the chain (dinput8-chain.ini)."
+
+- **XHL-Core and EMF** (as `dinput8.dll`): they stay `dinput8.dll`, and dllchain adds your mods to their `dinput8-chain.ini`.
+- **ModLoader Proxy** (renamed to `dinput8.dll`): it stays, and dllchain lists your mods under `[Load]` in its `chainloader.ini` (it makes one if there is none, and takes it away again when it is empty).
+  That works whether `LoadFromFolder` is on or off, so dllchain does not drop loose DLLs into its mods folder, which by default is the same `mods\` folder other tools use.
+- **ShroudForge**: each mod goes into a folder of its own under `mods\`, where ShroudForge loads it; `dinput8-chain.ini` is left as it is.
+- **Multi DLL Installer**: the mods it renamed to `dinput9.dll`, `dinput10.dll` and so on are left as they are and noted in status; dllchain never gives a mod such a name.
+- A loader's own zip is not installed as a mod: install the loader first, then dllchain adds your mods to its list.
+
+In any list file, dllchain only adds and removes its own mods' lines.
+Everything else stays as it was: other sections (such as `[EMF]` or `[Settings]`), `[Options]` and its `Forward=` line, comments, blank lines, the order and each line's line ending.
+New lines take the file's own line ending.
+Uninstall gives the file back byte for byte, apart from dllchain's lines.
+
+`Forward=` (in `[Options]`) and ModLoader Proxy's `ForwardTo` hand the game's own calls to another DLL.
+They are the loader's settings, so dllchain never changes them.
+When you remove the mod such a line names, the plan says so plainly before anything happens, and status keeps a note while the line names a file that is not there; change or remove the line yourself, or Undo to get the mod back.
 
 ## Is this download the real one?
 

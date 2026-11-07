@@ -1,14 +1,15 @@
 //! Install, repair and uninstall, each in two halves: a [`Plan`] that says what would change (and changes nothing),
 //! and [`apply`], which makes the changes in one undoable run and checks the folder afterwards.
 //!
-//! Who hosts: only the DLL called `dinput8.dll` runs, and it starts the others from `dinput8-chain.ini`. With EMF's
-//! loader as `dinput8.dll`, every mod is a guest. Otherwise the host is the mod that is `dinput8.dll` now when it can
+//! Who hosts: only the DLL called `dinput8.dll` runs, and it starts the others from `dinput8-chain.ini`. With a loader
+//! that only loads mods as `dinput8.dll` (EMF's, XHL-Core, ModLoader Proxy; [`Game::loaders`]), every mod is a guest in
+//! the file that loader reads, and the loader itself is never moved, replaced or deleted. Otherwise the host is the mod that is `dinput8.dll` now when it can
 //! host, else the newest mod that can; a mod that cannot read the chain file is only ever the host when it is alone.
 //! So the result is the same whatever order mods come in.
 
-use crate::chainini::{AddResult, ChainFile, Parsed};
+use crate::chainini::{AddResult, CHAIN, ChainFile, Format, Parsed};
 use crate::dllinfo::{DllInfo, WordFrom, contains_text, inspect};
-use crate::game::{Game, PackageHost, Requirement};
+use crate::game::{Game, Loader, PackageHost, Requirement};
 use crate::hash::{sha256_hex, short};
 use crate::paths::{RelPath, is_word, resolve};
 use crate::record::{FileRec, Kind, ModRec, RECORD, Record, clean_name, store_rel};
@@ -71,6 +72,11 @@ impl Ctx {
         RelPath::of(self.game.chain_file)
     }
 
+    /// The layout of a list file: a loader's own, else the chain file's.
+    fn format_of(&self, list: &RelPath) -> Format {
+        self.game.loaders.iter().find(|l| list.same(&RelPath::of(l.list))).map_or(CHAIN, |l| l.format)
+    }
+
     /// Undoes a run that was cut off, when there is one.
     pub fn recover(&self) -> Result<Option<Vec<String>>> {
         recover(&self.dir)
@@ -110,8 +116,9 @@ pub struct Plan {
     record: Record,
     /// Files as they must be after the run (`None`: not there).
     expect_files: Vec<(RelPath, Option<String>)>,
-    /// Chain lines as they must be after the run.
+    /// Chain lines as they must be after the run, and the list file they are in.
     expect_chain: Vec<(RelPath, bool)>,
+    list: Option<(RelPath, Format)>,
     remove_own_dir: bool,
     /// For tests: fail after this many steps.
     #[doc(hidden)]
@@ -170,10 +177,17 @@ fn put_back_after(steps: &[Step], i: usize, r: &RelPath) -> bool {
 struct Scan {
     record: Record,
     notes: Vec<String>,
+    /// The file the host reads the guests from: the chain file, or the one the loader that hosts reads.
+    list: RelPath,
     chain: Option<ChainFile>,
     parsed: Parsed,
+    /// The list file the record's lines are in, when the host reads another one now (ModLoader Proxy came in as
+    /// `dinput8.dll`, or left): dllchain's lines leave it.
+    old_list: Option<(RelPath, Option<ChainFile>)>,
     /// `dinput8.dll` now, with what it is.
     host: Option<(Vec<u8>, DllInfo)>,
+    /// The loader that hosts, when `dinput8.dll` is one that only loads mods.
+    loader: Option<&'static Loader>,
     /// Guests replaced by hand with another build of the same mod: (word, the file's bytes, what it is).
     rebuilt: Vec<(String, Vec<u8>, DllInfo)>,
 }
@@ -199,8 +213,6 @@ fn scan(ctx: &Ctx) -> Result<Scan> {
     };
     record.drop_incomplete(&mut notes);
     keep_safe(&mut record, ctx.game, &mut notes);
-    let chain = ctx.read(&ctx.chain_rel()).map(|b| ChainFile::decode(&b));
-    let parsed = chain.as_ref().map(|c| c.parse(ctx.game.host_dll)).unwrap_or_default();
     let host = match ctx.read(&ctx.host()) {
         Some(bytes) => {
             let info = inspect(&bytes, ctx.game).map_err(|e| {
@@ -213,16 +225,23 @@ fn scan(ctx: &Ctx) -> Result<Scan> {
         }
         None => None,
     };
-    if !record.mods.is_empty() {
+    let loader = host.as_ref().and_then(|(_, i)| i.loader);
+    let list = loader.map_or_else(|| ctx.chain_rel(), |l| RelPath::of(l.list));
+    let format = ctx.format_of(&list);
+    let chain = ctx.read(&list).map(|b| ChainFile::decode_as(&b, format));
+    let parsed = chain.as_ref().map(|c| c.parse(ctx.game.host_dll)).unwrap_or_default();
+    let record_list = record.chain_file.clone().unwrap_or_else(|| ctx.chain_rel());
+    let old_list = (!record_list.same(&list) && (record.chain_created || !record.chain.is_empty())).then(|| {
+        let old = ctx.read(&record_list).map(|b| ChainFile::decode_as(&b, ctx.format_of(&record_list)));
+        (record_list, old)
+    });
+    if !record.mods.is_empty() && old_list.is_none() {
         for (name, on) in &record.chain {
             match parsed.find(name) {
-                None => notes.push(format!(
-                    "{}: the line for {name} was taken out by someone else since dllchain last ran",
-                    ctx.game.chain_file
-                )),
+                None => notes
+                    .push(format!("{list}: the line for {name} was taken out by someone else since dllchain last ran")),
                 Some(e) if e.on != *on => notes.push(format!(
-                    "{}: {name} was switched {} by someone else since dllchain last ran",
-                    ctx.game.chain_file,
+                    "{list}: {name} was switched {} by someone else since dllchain last ran",
                     if e.on { "on" } else { "off" }
                 )),
                 _ => {}
@@ -234,23 +253,23 @@ fn scan(ctx: &Ctx) -> Result<Scan> {
                     Some(s) => format!("SHA-256 {}", short(&s)),
                     None => "the file is not there".into(),
                 };
-                notes.push(format!(
-                    "{}: {} was added by someone else since dllchain last ran ({what})",
-                    ctx.game.chain_file, e.name
-                ));
+                notes.push(format!("{list}: {} was added by someone else since dllchain last ran ({what})", e.name));
             }
         }
     }
     for r in &parsed.refused {
-        notes.push(format!(
-            "{} line {} ignored, as every chain loader does: {} ({})",
-            ctx.game.chain_file,
-            r.line + 1,
-            r.text,
-            r.why
-        ));
+        notes.push(if format == CHAIN {
+            format!("{list} line {} ignored, as every chain loader does: {} ({})", r.line + 1, r.text, r.why)
+        } else {
+            format!(
+                "{list} line {}: {} is not a DLL in the game folder ({}); dllchain leaves it as it is",
+                r.line + 1,
+                r.text,
+                r.why
+            )
+        });
     }
-    let mut scan = Scan { record, notes, chain, parsed, host, rebuilt: Vec::new() };
+    let mut scan = Scan { record, notes, list, chain, parsed, old_list, host, loader, rebuilt: Vec::new() };
     scan.rebuilt = scan.record.mods.iter().filter_map(|m| rebuilt(ctx, &scan, m)).collect();
     Ok(scan)
 }
@@ -277,7 +296,7 @@ fn rebuilt(ctx: &Ctx, scan: &Scan, m: &ModRec) -> Option<(String, Vec<u8>, DllIn
         }
     };
     let theirs = scan.record.mods.iter().any(|o| o.dll_sha == info.sha256);
-    (same_mod && !info.is_emf && !theirs).then(|| (m.word.clone(), bytes, info))
+    (same_mod && info.loader.is_none() && !theirs).then(|| (m.word.clone(), bytes, info))
 }
 
 /// What a mod with these files needs and the game folder does not have. Only DLLs the game loads count: the host,
@@ -331,6 +350,15 @@ fn keep_safe(record: &mut Record, game: &Game, notes: &mut Vec<String>) {
         }
         true
     });
+    if let Some(f) = record.chain_file.take() {
+        if game.list_files().iter().any(|l| f.same(&RelPath::of(l))) {
+            record.chain_file = Some(f);
+        } else {
+            notes.push(format!("record: {f} is no loader's list file dllchain knows; its chain lines are left out"));
+            record.chain.clear();
+            record.chain_created = false;
+        }
+    }
 }
 
 /// The folder a package host runs a mod from: `mods\<word>`.
@@ -519,13 +547,13 @@ impl<'a> Work<'a> {
         w
     }
 
-    /// A `dinput8.dll` that is neither EMF's nor one of dllchain's mods: another mod copied over, or there before
+    /// A `dinput8.dll` that is neither a loader nor one of dllchain's mods: another mod copied over, or there before
     /// dllchain. It joins the chain like any mod (a newer copy of a mod on the list takes that mod's place); dllchain
     /// keeps a copy and never deletes it. With `installing`, the word of the mod being installed: a copy of that same
     /// tool is replaced by the install and comes back on uninstall; its SHA-256 is returned.
     fn adopt_host(&mut self, installing: Option<&str>) -> Option<String> {
         let (bytes, info) = self.scan.host.as_ref()?;
-        if info.is_emf || self.mods.iter().any(|m| m.dll_sha == info.sha256) {
+        if info.loader.is_some() || self.mods.iter().any(|m| m.dll_sha == info.sha256) {
             return None;
         }
         let host = self.ctx.host();
@@ -603,7 +631,7 @@ impl<'a> Work<'a> {
     fn layout(&mut self) -> Result<()> {
         let ctx = self.ctx;
         let host = ctx.host();
-        let emf = self.scan.host.as_ref().is_some_and(|(_, i)| i.is_emf);
+        let loader_hosts = self.scan.loader.is_some();
         let n = self.mods.len();
         let can_host: Vec<bool> = self
             .mods
@@ -627,7 +655,7 @@ impl<'a> Work<'a> {
 
         // a loader that refuses every other DLL next to the game must stay dinput8.dll itself
         let package_host = (0..n).find(|&i| ctx.game.package_host(&self.mods[i].word).is_some());
-        let host_i = if emf || n == 0 {
+        let host_i = if loader_hosts || n == 0 {
             None
         } else if n == 1 {
             Some(0)
@@ -695,7 +723,9 @@ impl<'a> Work<'a> {
                     Some(l) if !l.same(&host) && !taken(l, &targets) => l.clone(),
                     _ => {
                         let mut base = m.word.clone();
-                        if ctx.game.proxy_names.contains(&base.as_str()) || (ctx.in_system32)(&base) {
+                        // (dinput9, dinput10...: the names Multi DLL Installer gives the mods it renames)
+                        let numbered = base.strip_prefix("dinput").is_some_and(|k| k.parse::<u32>().is_ok());
+                        if ctx.game.proxy_names.contains(&base.as_str()) || (ctx.in_system32)(&base) || numbered {
                             base.push_str("-mod");
                         }
                         let mut k = 1;
@@ -784,8 +814,10 @@ impl<'a> Work<'a> {
             self.plan.expect_files.push((t.clone(), Some(sha)));
         }
 
-        // the chain file
-        let mut chain = self.scan.chain.clone().unwrap_or_default();
+        // the chain file, or the list file of the loader that hosts
+        let list = self.scan.list.clone();
+        let format = ctx.format_of(&list);
+        let mut chain = self.scan.chain.clone().unwrap_or_else(|| ChainFile::new_as(format));
         let before = chain.clone();
         let mut ours: Vec<RelPath> =
             self.scan.record.mods.iter().filter(|m| is_chained(ctx.game, m)).map(|m| m.dll_at.clone()).collect();
@@ -806,9 +838,8 @@ impl<'a> Work<'a> {
             let r = chain.add(&targets[g], ctx.game.host_dll, on);
             if r == AddResult::KeptOff {
                 self.plan.notes.push(format!(
-                    "{} is switched off, so it stays off. To switch it on, take the '; ' away from the start of its line in {}",
+                    "{} is switched off, so it stays off. To switch it on, take the '; ' away from the start of its line in {list}",
                     self.display(word),
-                    ctx.game.chain_file
                 ));
             }
             if r == AddResult::SwitchedOn {
@@ -822,26 +853,33 @@ impl<'a> Work<'a> {
                 expect_chain.push((e.name.clone(), e.on)); // others' lines stay as they are
             }
         }
-        let chain_rel = ctx.chain_rel();
-        let mut created = self.scan.record.chain_created;
+        // the record's `chain-created` is about the file its lines are in
+        let mut created = self.scan.record.chain_created && self.scan.old_list.is_none();
         if chain != before {
-            if !chain.names_any_dll(ctx.game.host_dll) && (created || self.scan.chain.is_none()) {
-                if self.scan.chain.is_some() {
-                    self.plan.steps.push(Step::Delete(chain_rel.clone()));
-                }
-                self.plan.expect_files.push((chain_rel, None));
-                created = false;
-                chain = ChainFile::new();
-            } else {
-                if self.scan.chain.is_none() {
-                    created = true;
-                }
-                let bytes = chain.encode();
-                self.plan.expect_files.push((chain_rel.clone(), Some(sha256_hex(&bytes))));
-                self.plan.steps.push(Step::Write(chain_rel, bytes));
+            if let Some(l) = self.scan.loader.filter(|_| !guests.is_empty()) {
+                self.plan.notes.push(format!(
+                    "{} is {}, so dllchain lists the mods in {list}, where {} loads them, and leaves {} itself as it is.",
+                    l.name,
+                    ctx.game.host_dll,
+                    l.name,
+                    l.name
+                ));
+            }
+            created = self.write_list(&list, self.scan.chain.as_ref(), &chain, created);
+        }
+        // the lines in the file the host read before go: dllchain's mods are in the new host's file now
+        if let Some((old_rel, Some(old))) = &self.scan.old_list {
+            let mut c = old.clone();
+            for r in &ours {
+                c.remove(r);
+            }
+            if c != *old {
+                self.plan.summary.push(format!("dllchain's lines move from {old_rel} to {list}."));
+                self.write_list(old_rel, Some(old), &c, self.scan.record.chain_created);
             }
         }
         self.plan.expect_chain = expect_chain;
+        self.plan.list = Some((list.clone(), format));
 
         for (m, t) in self.mods.iter_mut().zip(&targets) {
             m.dll_at = t.clone();
@@ -867,8 +905,25 @@ impl<'a> Work<'a> {
             mods: self.all().cloned().collect(),
             chain_created: created,
             chain: chain.parse(ctx.game.host_dll).entries.iter().map(|e| (e.name.clone(), e.on)).collect(),
+            chain_file: (!list.same(&ctx.chain_rel())).then_some(list),
         };
         Ok(())
+    }
+
+    /// Writes a list file as `chain` has it, or deletes it when dllchain made it (`created`) and no DLL is left in it.
+    /// Returns whether dllchain made the file that is there afterwards.
+    fn write_list(&mut self, rel: &RelPath, now: Option<&ChainFile>, chain: &ChainFile, created: bool) -> bool {
+        if !chain.names_any_dll(self.ctx.game.host_dll) && (created || now.is_none()) {
+            if now.is_some() {
+                self.plan.steps.push(Step::Delete(rel.clone()));
+            }
+            self.plan.expect_files.push((rel.clone(), None));
+            return false;
+        }
+        let bytes = chain.encode();
+        self.plan.expect_files.push((rel.clone(), Some(sha256_hex(&bytes))));
+        self.plan.steps.push(Step::Write(rel.clone(), bytes));
+        created || now.is_none()
     }
 
     /// A single mod dllchain did not install, back as dinput8.dll with no chain: nothing left to keep track of, so it
@@ -891,8 +946,42 @@ impl<'a> Work<'a> {
         self.plan.record.chain.clear();
     }
 
+    /// When the list file's forward setting (`Forward=`, `ForwardTo=`) names a file this run takes away, says so
+    /// plainly. The setting is the host's, not dllchain's, so dllchain leaves it as it is (and Uninstall gives back the
+    /// host's file as it was, apart from dllchain's own lines); the player decides what gets the game's calls now.
+    fn say_forward_gone(&mut self) {
+        let Some(chain) = &self.scan.chain else { return };
+        let Some(target) = chain.forward().and_then(|v| RelPath::parse(&v).ok()) else { return };
+        if !self.ctx.exists(&target) {
+            return;
+        }
+        let mut there = true;
+        for s in &self.plan.steps {
+            match s {
+                Step::Write(r, _) if r.same(&target) => there = true,
+                Step::Delete(r) if r.same(&target) => there = false,
+                Step::Rename(a, b) if a.same(&target) || b.same(&target) => there = b.same(&target),
+                _ => {}
+            }
+        }
+        if there {
+            return;
+        }
+        let host = self.scan.loader.map(|l| l.name.to_string()).or_else(|| {
+            let (_, info) = self.scan.host.as_ref()?;
+            default_name(info).or_else(|| info.word.as_ref().map(|w| self.ctx.game.display(&w.0)))
+        });
+        let host = host.unwrap_or_else(|| "the loader".into());
+        let (section, key) = chain.format.forward;
+        let list = &self.scan.list;
+        self.plan.summary.push(format!(
+            "The {key}= line in [{section}] of {list} hands the game's own calls to {target}, which this takes away. dllchain leaves that line as it is, as it is {host}'s setting: change or remove it in {list}, or {host} looks for a file that is not there."
+        ));
+    }
+
     /// Writes the record last (or plans to remove dllchain's folder when nothing is left).
     fn finish(mut self) -> Plan {
+        self.say_forward_gone();
         let rel = RelPath::of(RECORD);
         if self.plan.record.is_empty() {
             if self.ctx.exists(&RelPath::of(OWN_DIR)) {
@@ -956,8 +1045,13 @@ impl<'a> Work<'a> {
 pub fn plan_install(ctx: &Ctx, src: &ModSource) -> Result<Plan> {
     let scan = scan(ctx)?;
     let info = inspect(&src.dll, ctx.game)?;
-    if info.is_emf {
-        fail!("{} is EMF; install EMF with its own install.cmd", src.label);
+    if let Some(l) = info.loader {
+        fail!(
+            "{} is {}, a loader for other mods, not a mod: {}. Once it is in, dllchain adds the mods you install to its list.",
+            src.label,
+            l.name,
+            l.install
+        );
     }
     let action = format!("install {} (SHA-256 {})", src.label, src.sha256);
     if src.own_loader(ctx.game) {
@@ -2512,14 +2606,12 @@ fn verify(ctx: &Ctx, plan: &Plan) -> Result<()> {
             fail!("the check after the change found {rel} not as planned");
         }
     }
-    let chain = ctx.read(&ctx.chain_rel()).map(|b| ChainFile::decode(&b)).unwrap_or_default();
-    let parsed = chain.parse(ctx.game.host_dll);
+    let (list, format) = plan.list.clone().unwrap_or_else(|| (ctx.chain_rel(), CHAIN));
+    let parsed = ctx.read(&list).map(|b| ChainFile::decode_as(&b, format).parse(ctx.game.host_dll)).unwrap_or_default();
     for (name, on) in &plan.expect_chain {
         match parsed.find(name) {
             Some(e) if e.on == *on => {}
-            _ => {
-                fail!("the check after the change found the line for {name} in {} not as planned", ctx.game.chain_file)
-            }
+            _ => fail!("the check after the change found the line for {name} in {list} not as planned"),
         }
     }
     let host = ctx.host();
@@ -2633,6 +2725,10 @@ pub struct Status {
     pub undo: Option<(String, String)>,
     /// The loader that runs mods from folders of their own, when the game has one: its name and that folder (`mods`).
     pub package_host: Option<(String, String)>,
+    /// The loader that only loads mods, when it is the host: its name and the file it lists them in.
+    pub loader: Option<(String, String)>,
+    /// Who loads the mods, in one line: "XHL-Core loads the chain (dinput8-chain.ini)."
+    pub host: Option<String>,
 }
 
 /// The numbers of a version, without a tag: `0.12.2-beta` and `v0.12.2` are both `0.12.2`.
@@ -2859,11 +2955,13 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         };
         details.push(pair("From", format!("{from}; not on dllchain's list")));
         let package_host = info.as_ref().and_then(|i| i.word.as_ref()).and_then(|w| ctx.game.package_host(&w.0));
-        if rel.same(&host) && scan.record.is_empty() {
+        if rel.same(&host) && (scan.record.is_empty() || scan.loader.is_some()) {
             details.push(pair("", "dllchain leaves it as it is.".into()));
             match package_host {
                 Some(ph) => details
                     .push(pair("", format!("A mod you install goes into {}\\<mod>\\, where {name} loads it.", ph.dir))),
+                None if scan.loader.is_some() => details
+                    .push(pair("", format!("A mod you install is listed in {}, where {name} loads it.", scan.list))),
                 None => {
                     details.push(pair("", "When you install another mod, it joins the chain".into()));
                     details.push(pair("", "and dllchain keeps a copy of it.".into()));
@@ -2893,18 +2991,46 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             load: None,
         }
     };
+    let list = &scan.list;
     if ctx.exists(&host) {
         let can = scan.host.as_ref().map(|(_, i)| i.can_host).unwrap_or(false);
-        let role = if can { "game loads it; starts others" } else { "game loads it; starts no others" };
-        st.rows.push(row(&host, role.into(), None));
+        let role = match scan.loader {
+            Some(_) => format!("game loads it; loads the mods in {list}"),
+            None if can => "game loads it; starts others".into(),
+            None => "game loads it; starts no others".into(),
+        };
+        st.rows.push(row(&host, role, None));
     }
+    let starter = scan.loader.map_or(ctx.game.host_dll, |l| l.name);
     for e in &scan.parsed.entries {
         let role = match (e.on, ctx.exists(&e.name)) {
-            (true, true) => format!("started by {}", ctx.game.host_dll),
-            (false, _) => "switched off".to_string(),
+            (true, true) => format!("started by {starter}"),
+            (false, true) => "switched off".to_string(),
             (true, false) => "listed, but missing".to_string(),
+            // a switched-off line for a file that is not there (such as an example in the file as its loader ships)
+            (false, false) => continue,
         };
         st.rows.push(row(&e.name, role, None));
+    }
+    if let Some(l) = scan.loader {
+        st.loader = Some((l.name.to_string(), list.to_string()));
+    }
+    if let Some(target) = scan.chain.as_ref().and_then(|c| c.forward().map(|v| (v, c.format.forward))) {
+        let (value, (section, key)) = target;
+        if !RelPath::parse(&value).is_ok_and(|r| ctx.exists(&r)) {
+            st.notes.push(format!(
+                "The {key}= line in [{section}] of {list} names {value}, which is not in the game folder: change or remove that line."
+            ));
+        }
+    }
+    // Multi DLL Installer renames each mod to dinput9.dll, dinput10.dll and so on; whatever is dinput8.dll loads them
+    let renamed: Vec<String> =
+        (9..=40).map(|k| format!("dinput{k}.dll")).filter(|n| ctx.exists(&RelPath::of(n))).collect();
+    if !renamed.is_empty() {
+        st.notes.push(format!(
+            "{} look like mods Multi DLL Installer renamed. dllchain leaves them as they are and never gives a mod such a name.",
+            renamed.join(", ")
+        ));
     }
     for p in ctx.game.proxy_names {
         let rel = RelPath::of(&format!("{p}.dll"));
@@ -2939,6 +3065,15 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             ));
         }
     }
+    let host_row = st.rows.iter().find(|r| r.file.same(&host)).map(|r| r.name.clone());
+    st.host = match (&st.package_host, scan.loader, host_row) {
+        (Some((name, dir)), _, _) => Some(format!("{name} loads the mods from {dir}\\<mod>\\.")),
+        (None, Some(l), _) => Some(format!("{} loads the chain ({list}).", l.name)),
+        (None, None, Some(name)) if scan.parsed.on().next().is_some() => {
+            Some(format!("{name} loads the chain ({list})."))
+        }
+        _ => None,
+    };
     let loader = st.package_host.as_ref().map_or("its loader", |p| p.0.as_str()).to_string();
     for m in scan.record.mods.iter().filter(|m| is_package(m)) {
         st.rows.push(row(&m.dll_at, format!("loaded by {loader} from its own folder"), Some(m)));

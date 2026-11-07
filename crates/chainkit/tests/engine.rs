@@ -1854,3 +1854,263 @@ fn the_same_zip_again_keeps_when_the_mod_was_installed() {
     let p = plan_install(&c, &src("xhl.zip", xhl(), &[])).unwrap();
     assert!(p.is_empty(), "{:?} {:?}", p.summary, p.files);
 }
+
+// Other loaders: XHL-Core, EMF, ModLoader Proxy, ShroudForge, and Multi DLL Installer's folders.
+
+/// XHL-Core's dinput8.dll: it reads the chain file and says who it is.
+fn xhl_core() -> Vec<u8> {
+    fake_dll(&["dinput8-chain.ini"], Some("XHL-Core"))
+}
+
+/// ModLoader Proxy renamed to dinput8.dll: its strings are UTF-16.
+fn mlp() -> Vec<u8> {
+    let mut b = fake_dll(&[], None);
+    for t in ["chainloader.ini", "modloader-proxy.log"] {
+        b.extend(t.encode_utf16().flat_map(|u| u.to_le_bytes()));
+    }
+    b
+}
+
+/// chainloader.ini as ModLoader Proxy ships it (CRLF), with folder loading on or off.
+fn mlp_ini(from_folder: bool) -> Vec<u8> {
+    format!(
+        "; modloader-proxy configuration. Place next to the renamed proxy DLL.\r\n\r\n[Settings]\r\nLog = true\r\n\
+         Deferred = false\r\nDelayMs = 0\r\n\r\nLoadFromFolder = {from_folder}\r\nModsFolder = mods\r\n\
+         ; ForwardTo = mods\\XHL\\dinput8.dll\r\n\r\n[Load]\r\n; Explicit entries, loaded first, in this order.\r\n\
+         ; ExampleMod.dll\r\n; somefolder\\AnotherMod.dll\r\n"
+    )
+    .into_bytes()
+}
+
+/// The [Load] lines that are switched on.
+fn load_list(dir: &Path) -> Vec<String> {
+    let Some(b) = read(dir, "chainloader.ini") else {
+        return Vec::new();
+    };
+    let f = ChainFile::decode_as(&b, chainkit::chainini::LOAD);
+    f.parse("dinput8.dll").entries.iter().filter(|e| e.on).map(|e| e.name.to_string()).collect()
+}
+
+/// With `host` as dinput8.dll and the files around it: installs, installs a mod that could host, updates, uninstalls
+/// one, undoes that and uninstalls everything. The loader stays dinput8.dll throughout, and at the end the game folder
+/// is exactly as it was, the loader's list file byte for byte.
+fn loader_round(name: &str, host: Vec<u8>, around: &[(&str, &[u8])], list: &str) -> (PathBuf, Ctx) {
+    let dir = game(name);
+    put(&dir, "dinput8.dll", &host);
+    for (rel, b) in around {
+        put(&dir, rel, b);
+    }
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let lines = |dir: &Path| -> Vec<String> {
+        if list == "chainloader.ini" { load_list(dir) } else { chain(dir).into_iter().map(|e| e.0).collect() }
+    };
+
+    let p = install(&c, &src("alp.zip", alp(), &[("mods\\alp\\config.txt", b"v1")]));
+    assert!(p.files.iter().any(|f| f.starts_with(list)), "{:?}", p.files);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(host.clone()), "the loader stays dinput8.dll");
+    assert_eq!(read(&dir, "auto-loot-plus.dll"), Some(alp()));
+    assert!(lines(&dir).contains(&"auto-loot-plus.dll".to_string()), "{:?}", lines(&dir));
+    // a mod that could host is a guest too
+    install(&c, &src("shiny.zip", shiny(), &[]));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(host.clone()));
+    assert!(lines(&dir).ends_with(&["auto-loot-plus.dll".to_string(), "shiny-mod.dll".to_string()]));
+    // an update keeps its place
+    let p = install(&c, &src("alp.zip", alp2(), &[("mods\\alp\\config.txt", b"v1")]));
+    assert_eq!(p.files, vec!["auto-loot-plus.dll (replaced)"]);
+    assert!(plan_repair(&c).unwrap().is_empty());
+
+    let with_both = without_own(&snapshot(&dir));
+    run(&c, plan_uninstall(&c, Some("shiny-mod")));
+    assert!(!dir.join("shiny-mod.dll").exists());
+    assert!(!lines(&dir).contains(&"shiny-mod.dll".to_string()));
+    run(&c, plan_undo(&c));
+    assert_eq!(without_own(&snapshot(&dir)), with_both);
+
+    let st = status(&c).unwrap();
+    assert!(st.rows[0].role.contains(&format!("loads the mods in {list}")), "{:?}", st.rows[0].role);
+
+    run(&c, plan_uninstall(&c, None));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before, "the folder is as it was, the loader's file byte for byte");
+    (dir, c)
+}
+
+#[test]
+fn xhl_core_keeps_its_chain_its_options_and_its_line_endings() {
+    let ini: &[u8] = b"; XHL-Core chain\n[Chain]\nhand.dll\n\n[Options]\nForward=hand.dll\n";
+    let around: &[(&str, &[u8])] = &[("dinput8-chain.ini", ini), ("hand.dll", &other())];
+    let (dir, c) = loader_round("xhl-core", xhl_core(), around, "dinput8-chain.ini");
+    // the new line ends as the file's own lines do
+    install(&c, &src("alp.zip", alp(), &[]));
+    let text = String::from_utf8(read(&dir, "dinput8-chain.ini").unwrap()).unwrap();
+    assert_eq!(text, "; XHL-Core chain\n[Chain]\nhand.dll\nauto-loot-plus.dll\n\n[Options]\nForward=hand.dll\n");
+    let st = status(&c).unwrap();
+    assert_eq!(st.host.as_deref(), Some("XHL-Core loads the chain (dinput8-chain.ini)."));
+    assert_eq!(st.loader, Some(("XHL-Core".to_string(), "dinput8-chain.ini".to_string())));
+    assert!(st.rows.iter().any(|r| r.file.as_str() == "hand.dll" && r.role == "started by XHL-Core"));
+    // the hand-installed mod the forward names is there: nothing to say
+    assert!(st.notes.iter().all(|n| !n.contains("Forward=")), "{:?}", st.notes);
+}
+
+#[test]
+fn xhl_core_alone_is_left_as_it_is() {
+    let dir = game("xhl-core-alone");
+    put(&dir, "dinput8.dll", &xhl_core());
+    let c = ctx(&dir);
+    let st = status(&c).unwrap();
+    assert_eq!(st.host.as_deref(), Some("XHL-Core loads the chain (dinput8-chain.ini)."));
+    assert!(st.rows[0].details.iter().any(|d| d.1.contains("listed in dinput8-chain.ini, where XHL-Core loads it")));
+    // a loader's own zip is not a mod
+    let e = plan_install(&c, &src("XHL-Core-1.0.zip", xhl_core(), &[])).unwrap_err();
+    assert!(e.0.contains("XHL-Core, a loader for other mods"), "{e}");
+    let e = plan_install(&c, &src("modloader-proxy.zip", mlp(), &[])).unwrap_err();
+    assert!(e.0.contains("ModLoader Proxy, a loader"), "{e}");
+}
+
+#[test]
+fn emfs_own_section_and_options_survive() {
+    let ini: &[u8] = b"[EMF]\r\nversion=2\r\nmanaged=ShroudForge.dll\r\n\r\n[Chain]\r\n\r\n[Options]\r\nForward=\r\n";
+    let around: &[(&str, &[u8])] = &[("dinput8-chain.ini", ini), ("emf\\moved.txt", b"x")];
+    let (dir, c) = loader_round("emf-section", emf(), around, "dinput8-chain.ini");
+    install(&c, &src("alp.zip", alp(), &[]));
+    let text = String::from_utf8(read(&dir, "dinput8-chain.ini").unwrap()).unwrap();
+    let want = "[EMF]\r\nversion=2\r\nmanaged=ShroudForge.dll\r\n\r\n[Chain]\r\nauto-loot-plus.dll\r\n\r\n[Options]\r\nForward=\r\n";
+    assert_eq!(text, want);
+    assert_eq!(status(&c).unwrap().host.as_deref(), Some("EMF loads the chain (dinput8-chain.ini)."));
+}
+
+#[test]
+fn modloader_proxy_gets_the_mods_in_chainloader_ini() {
+    for from_folder in [false, true] {
+        let ini = mlp_ini(from_folder);
+        let (dir, c) =
+            loader_round(&format!("mlp-{from_folder}"), mlp(), &[("chainloader.ini", &ini)], "chainloader.ini");
+        let p = install(&c, &src("alp.zip", alp(), &[]));
+        assert!(p.notes.iter().any(|n| n.contains("dllchain lists the mods in chainloader.ini")), "{:?}", p.notes);
+        // listed under [Load] (which loads it whether or not folder loading is on), never in mods\ or the chain file
+        let mut want = ini.clone();
+        want.extend_from_slice(b"auto-loot-plus.dll\r\n");
+        assert_eq!(read(&dir, "chainloader.ini"), Some(want));
+        assert!(read(&dir, "dinput8-chain.ini").is_none());
+        assert!(!dir.join("mods").exists());
+        let st = status(&c).unwrap();
+        assert_eq!(st.host.as_deref(), Some("ModLoader Proxy loads the chain (chainloader.ini)."));
+        // its examples, switched off and not there, are no rows
+        assert!(st.rows.iter().all(|r| !r.file.as_str().contains("ExampleMod")));
+        let started = st.rows.iter().find(|r| r.file.as_str() == "auto-loot-plus.dll").map(|r| r.role.as_str());
+        assert_eq!(started, Some("started by ModLoader Proxy"));
+    }
+}
+
+#[test]
+fn modloader_proxy_without_its_ini_gets_one_and_loses_it_again() {
+    let dir = game("mlp-no-ini");
+    put(&dir, "dinput8.dll", &mlp());
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    assert_eq!(read(&dir, "chainloader.ini"), Some(b"[Load]\r\nauto-loot-plus.dll\r\n".to_vec()));
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn modloader_proxy_put_in_by_hand_takes_over_the_chain() {
+    let dir = game("mlp-after");
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    install(&c, &src("xhl.zip", xhl(), &[]));
+    assert_eq!(chain(&dir), vec![("xhl-core.dll".to_string(), true)]);
+    // the player copies ModLoader Proxy over Auto Loot Plus's dinput8.dll, with its ini
+    put(&dir, "dinput8.dll", &mlp());
+    put(&dir, "chainloader.ini", &mlp_ini(false));
+    let p = run(&c, plan_repair(&c));
+    let moved = "dllchain's lines move from dinput8-chain.ini to chainloader.ini.";
+    assert!(p.summary.iter().any(|l| l == moved), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(mlp()));
+    assert_eq!(read(&dir, "auto-loot-plus.dll"), Some(alp()));
+    // the old host ran first, and still does
+    assert_eq!(load_list(&dir), vec!["auto-loot-plus.dll", "xhl-core.dll"]);
+    // dllchain made dinput8-chain.ini, and nothing is left in it
+    assert!(read(&dir, "dinput8-chain.ini").is_none());
+    assert!(plan_repair(&c).unwrap().is_empty());
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(read(&dir, "chainloader.ini"), Some(mlp_ini(false)));
+    assert_eq!(read(&dir, "dinput8.dll"), Some(mlp()));
+    assert!(!dir.join("dllchain").exists());
+}
+
+#[test]
+fn removing_the_mod_a_forward_names_is_said_and_the_line_stays() {
+    for (host, list, section, key) in [
+        (xhl_core(), "dinput8-chain.ini", "[Options]", "Forward"),
+        (mlp(), "chainloader.ini", "[Settings]", "ForwardTo"),
+    ] {
+        let dir = game(&format!("forward-{key}"));
+        put(&dir, "dinput8.dll", &host);
+        let c = ctx(&dir);
+        install(&c, &src("alp.zip", alp(), &[]));
+        install(&c, &src("xhl.zip", xhl(), &[]));
+        // the player hands the game's calls to Auto Loot Plus
+        let mut text = String::from_utf8(read(&dir, list).unwrap()).unwrap();
+        text.push_str(&format!("\r\n{section}\r\n{key} = auto-loot-plus.dll\r\n"));
+        put(&dir, list, text.as_bytes());
+        let p = plan_uninstall(&c, Some("auto-loot-plus")).unwrap();
+        let said = p.summary.iter().find(|l| l.contains(&format!("{key}= line")));
+        let said = said.unwrap_or_else(|| panic!("{:?}", p.summary));
+        assert!(said.contains("auto-loot-plus.dll") && said.contains("leaves that line as it is"), "{said}");
+        apply(&c, &p).unwrap();
+        let after = String::from_utf8(read(&dir, list).unwrap()).unwrap();
+        assert!(after.contains(&format!("{key} = auto-loot-plus.dll")), "{after}");
+        let st = status(&c).unwrap();
+        let note = "names auto-loot-plus.dll, which is not in the game folder";
+        assert!(st.notes.iter().any(|n| n.contains(note)), "{:?}", st.notes);
+        // Undo brings the mod back, and the forward finds it again
+        run(&c, plan_undo(&c));
+        assert_eq!(read(&dir, "auto-loot-plus.dll"), Some(alp()));
+        assert!(status(&c).unwrap().notes.iter().all(|n| !n.contains(note)));
+        // uninstalling a mod the forward does not name says nothing about it
+        let p = plan_uninstall(&c, Some("xhl-core")).unwrap();
+        assert!(p.summary.iter().all(|l| !l.contains("= line")), "{:?}", p.summary);
+    }
+}
+
+#[test]
+fn shroudforge_leaves_the_chain_file_and_its_forward_alone() {
+    let dir = game("sf-forward");
+    shroudforge(&dir);
+    let ini: &[u8] = b"[EMF]\r\nx=1\r\n[Chain]\r\nhand.dll\r\n[Options]\r\nForward=hand.dll\r\n";
+    put(&dir, "dinput8-chain.ini", ini);
+    put(&dir, "hand.dll", &other());
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    // into its own folder, where ShroudForge loads it: no chain line, so nothing reaches the game's calls twice
+    assert_eq!(read(&dir, "dinput8-chain.ini").as_deref(), Some(ini));
+    assert!(dir.join("mods\\auto-loot-plus\\dinput8.dll").exists());
+    assert_eq!(status(&c).unwrap().host.as_deref(), Some("ShroudForge loads the mods from mods\\<mod>\\."));
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn multi_dll_installers_renamed_mods_are_left_alone() {
+    let dir = game("multi-dll");
+    put(&dir, "dinput8.dll", &fake_dll(&["shroudtopia"], None));
+    put(&dir, "dinput9.dll", &fake_dll(&["first"], None));
+    put(&dir, "dinput10.dll", &fake_dll(&["second"], None));
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    install(&c, &src("alp.zip", alp(), &[]));
+    // a mod that says it is "dinput9" does not get that name
+    install(&c, &src("d9.zip", fake_dll(&[], Some("dinput9")), &[]));
+    assert!(dir.join("dinput9-mod.dll").exists());
+    assert_eq!(read(&dir, "dinput9.dll"), before.get("dinput9.dll").cloned());
+    assert_eq!(read(&dir, "dinput10.dll"), before.get("dinput10.dll").cloned());
+    let st = status(&c).unwrap();
+    let note = "dinput9.dll, dinput10.dll look like mods Multi DLL Installer renamed";
+    assert!(st.notes.iter().any(|n| n.starts_with(note)), "{:?}", st.notes);
+    run(&c, plan_uninstall(&c, None));
+    assert_eq!(snapshot(&dir), before);
+}

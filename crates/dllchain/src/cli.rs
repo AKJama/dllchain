@@ -179,6 +179,9 @@ fn print_status(ctx: &Ctx) -> Result<()> {
     if !st.rows.is_empty() {
         println!();
     }
+    if let Some(h) = &st.host {
+        println!("{h}");
+    }
     for n in &st.notes {
         println!("Note: {n}");
     }

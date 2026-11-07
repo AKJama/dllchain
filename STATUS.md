@@ -1,5 +1,40 @@
 # dllchain status
 
+## 2026-11-07: other loaders and mod managers (branch wip/other-loaders)
+
+dllchain now keeps everything it does not own in another tool's list file, and adds mods to another loader's list instead of replacing it.
+
+### Rules
+
+- `chainini` keeps every line of the file as it was: other sections (`[EMF]`, `[Settings]`), `[Options]` with `Forward=`, comments, blank lines, order and each line's own line ending (CRLF, LF, none on the last line).
+  dllchain only adds or removes its own `[Chain]` (or `[Load]`) lines; a new line takes the file's first line ending, a new file CRLF.
+- A loader (`Game::loaders`: EMF, XHL-Core, ModLoader Proxy) as `dinput8.dll` is always the host: never moved, adopted, replaced or deleted, and its own zip is refused as a mod with "install it first".
+  Every mod, even one that could host, is a guest in the loader's list file.
+- ModLoader Proxy (from its source, github.com/Entrodor/modloader-proxy): `chainloader.ini` next to it, `[Settings]` and `[Load]`, `;`/`#` comments.
+  dllchain lists mods under `[Load]`, which loads them whether `LoadFromFolder` is on or off; its default ModsFolder `mods` is EML's and ShroudForge's `mods\`, so no loose DLLs go there.
+  Without a `chainloader.ini` dllchain makes one and deletes it again once it is empty.
+- The record has a new line `chain-file\t<name>` when the list file is not `dinput8-chain.ini`.
+  When the host changes (ModLoader Proxy put in by hand over a dllchain chain), repair moves dllchain's lines to the new list file, in their old order, and says so.
+- Forward (`[Options] Forward=`, `[Settings] ForwardTo`): dllchain never edits it, as it is the loader's setting.
+  When a run removes the file it names, the plan summary says so plainly before anything happens; status notes a forward that names a missing file; Undo brings the mod back.
+- ShroudForge: unchanged (mods in `mods\<mod>\`), and its `dinput8-chain.ini` with `Forward=` stays byte for byte.
+- Multi DLL Installer: `dinput<N>.dll` files are left alone and noted in status; a mod whose name would be `dinput<N>` gets `-mod`.
+- Status has a host line ("XHL-Core loads the chain (dinput8-chain.ini).", "ShroudForge loads the mods from mods\<mod>\."), shown in the window and the command line, and entries say "started by <loader>".
+
+### Not verified
+
+- XHL-Core's detection is a guess: a DLL with both "dinput8-chain.ini" and "XHL" in it, unless a known mod tool matches; its file format beyond the chain and `[Options]` is assumed.
+- EMF's `[EMF]` section contents are unknown; it is kept as opaque lines.
+- Where ShroudForge keeps a forward, if it has one.
+- How Multi DLL Installer's loader finds its `dinput<N>.dll` files.
+- None of this was tried in the game or with the real loaders' DLLs; all of it is fake DLLs in fixture folders.
+
+### Checks
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`: clean.
+- `cargo test --release`: 126 tests (45 chainkit lib, 70 engine, 6 window, 5 command line), up from 115.
+  New: round trips of six other tools' file shapes and ModLoader Proxy's ini; install, update, uninstall and undo with XHL-Core, EMF (with `[EMF]` and `[Options]`) and ModLoader Proxy (folder loading on and off), each ending byte for byte as it started; ModLoader Proxy without its ini, and put in by hand over a chain; a forward target removed (XHL `Forward`, ModLoader Proxy `ForwardTo`); ShroudForge with a forward; Multi DLL Installer names.
+
 ## 2026-11-07: mods that bring their own loader (branch wip/own-loader-mods)
 
 Town Portals (Greeneye Loader as `dbgcore.dll`) and Auto Doors (`powrprof.dll`) were refused with "has no dinput8.dll".

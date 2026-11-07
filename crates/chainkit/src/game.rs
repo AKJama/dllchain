@@ -1,6 +1,25 @@
 //! What is specific to a game. One entry today, Enshrouded; another game is another entry.
 
+use crate::chainini::{CHAIN, Format, LOAD};
 use crate::paths::RelPath;
+
+/// A loader that only loads other mods (it is no mod itself). As the host DLL it stays where it is and every mod is a
+/// guest in its list file; dllchain never moves, replaces or deletes it, and never installs it.
+#[derive(Debug)]
+pub struct Loader {
+    pub word: &'static str,
+    pub name: &'static str,
+    /// It is this loader when its DLL holds every text of one of these groups (plain or UTF-16, case ignored).
+    pub texts: &'static [&'static [&'static str]],
+    /// The file next to it that lists the mods it loads, and that file's layout.
+    pub list: &'static str,
+    pub format: Format,
+    /// How players install it, for the refusal when they pick its zip in dllchain.
+    pub install: &'static str,
+    /// Its texts are its own: a DLL that holds them is this loader even when it also names a mod from `tools` (EMF
+    /// names the mods it knows). Otherwise a DLL one of `tools` names is that mod, not this loader.
+    pub own_texts: bool,
+}
 
 /// A loader or DLL mod dllchain recognises by a text inside its DLL (plain or UTF-16, case ignored).
 #[derive(Debug)]
@@ -96,8 +115,8 @@ pub struct Game {
     pub chain_file: &'static str,
     /// A DLL that contains one of these texts can start the others when it is the host.
     pub host_texts: &'static [&'static str],
-    /// EMF's loader carries this text (its `loader_id.h`); EMF's own installer looks after it.
-    pub emf_texts: &'static [&'static str],
+    /// Loaders that only load mods; the first whose texts a DLL holds names it.
+    pub loaders: &'static [Loader],
     /// The first tool whose text a DLL contains names it; the order matters (ShroudForge's DLLs contain EML's text).
     pub tools: &'static [Tool],
     /// The Windows DLL names the game loads from its own folder before System32 (`host_dll` among them): a loader
@@ -128,7 +147,40 @@ pub static ENSHROUDED: Game = Game {
     host_dll: "dinput8.dll",
     chain_file: "dinput8-chain.ini",
     host_texts: &["dinput8-chain.ini"],
-    emf_texts: &["EMF-LOADER-7d3c9f", "emf_probe"],
+    loaders: &[
+        // EMF's loader carries its `loader_id.h` text; EMF's own installer and manager look after it.
+        Loader {
+            word: "emf",
+            name: "EMF",
+            texts: &[&["EMF-LOADER-7d3c9f"], &["emf_probe"]],
+            list: "dinput8-chain.ini",
+            format: CHAIN,
+            install: "install EMF with its own install.cmd",
+            own_texts: true,
+        },
+        // XHL-Core began dinput8-chain.ini. Its page (Nexus mod 236) could not be read here, so this is a guess from
+        // what it is: a DLL that reads the chain file and says XHL.
+        Loader {
+            word: "xhl-core",
+            name: "XHL-Core",
+            texts: &[&["dinput8-chain.ini", "XHL"]],
+            list: "dinput8-chain.ini",
+            format: CHAIN,
+            install: "put it in the game folder as its page says",
+            own_texts: false,
+        },
+        // ModLoader Proxy (github.com/Entrodor/modloader-proxy, src/main.cpp read 2026-11-07) reads chainloader.ini
+        // next to it, whatever name it was given; dllchain follows it when that name is dinput8.dll.
+        Loader {
+            word: "modloader-proxy",
+            name: "ModLoader Proxy",
+            texts: &[&["modloader-proxy"], &["chainloader.ini"]],
+            list: "chainloader.ini",
+            format: LOAD,
+            install: "rename it and put it in the game folder as its page says",
+            own_texts: true,
+        },
+    ],
     // The lines after auto-loot-plus are EMF's known_tools.txt (MIT, Copyright (c) 2026 EMF contributors; see
     // THIRD-PARTY-NOTICES.txt), so both tools give a renamed DLL the same name.
     tools: &[
@@ -222,7 +274,20 @@ impl Game {
 
     /// The name players see for a word: the tool's name, or the word itself.
     pub fn display(&self, word: &str) -> String {
-        self.tools.iter().find(|t| t.word == word).map(|t| t.name.to_string()).unwrap_or_else(|| word.to_string())
+        let tool = self.tools.iter().find(|t| t.word == word).map(|t| t.name);
+        let loader = || self.loaders.iter().find(|l| l.word == word).map(|l| l.name);
+        tool.or_else(loader).map_or_else(|| word.to_string(), str::to_string)
+    }
+
+    /// The list files of the game's host: its own chain file, and the loaders' (each once).
+    pub fn list_files(&self) -> Vec<&'static str> {
+        let mut out = vec![self.chain_file];
+        for l in self.loaders {
+            if !out.iter().any(|f| f.eq_ignore_ascii_case(l.list)) {
+                out.push(l.list);
+            }
+        }
+        out
     }
 }
 

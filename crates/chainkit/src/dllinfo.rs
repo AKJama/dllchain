@@ -1,6 +1,6 @@
 //! What a DLL is, read from its bytes only: nothing is loaded or run.
 
-use crate::game::Game;
+use crate::game::{Game, Loader};
 use crate::hash::sha256_hex;
 use crate::paths::slug;
 use crate::{Result, fail};
@@ -24,18 +24,27 @@ pub struct DllInfo {
     pub version: Option<String>,
     /// It reads the chain file, so it can start the others when it is the host.
     pub can_host: bool,
-    /// EMF's own loader.
-    pub is_emf: bool,
+    /// A loader that only loads mods (EMF's, XHL-Core, ModLoader Proxy): it hosts, and is never a mod in the chain.
+    pub loader: Option<&'static Loader>,
+}
+
+impl DllInfo {
+    pub fn is_emf(&self) -> bool {
+        self.loader.is_some_and(|l| l.word == "emf")
+    }
 }
 
 /// Checks that `bytes` is a 64-bit Windows DLL and says what it is.
 pub fn inspect(bytes: &[u8], game: &Game) -> Result<DllInfo> {
     check_x64_dll(bytes)?;
-    let is_emf = game.emf_texts.iter().any(|t| contains_text(bytes, t));
     let product_name = version_string(bytes, "ProductName").or_else(|| version_string(bytes, "FileDescription"));
     let known = game.tools.iter().find(|t| t.texts.iter().any(|x| contains_text(bytes, x)));
-    let word = if is_emf {
-        Some(("emf".to_string(), WordFrom::Known))
+    let loader = game.loaders.iter().find(|l| {
+        l.texts.iter().any(|group| group.iter().all(|t| contains_text(bytes, t)))
+            && (l.own_texts || known.is_none_or(|t| t.word == l.word))
+    });
+    let word = if let Some(l) = loader {
+        Some((l.word.to_string(), WordFrom::Known))
     } else if let Some(t) = known {
         Some((t.word.to_string(), WordFrom::Known))
     } else {
@@ -52,8 +61,8 @@ pub fn inspect(bytes: &[u8], game: &Game) -> Result<DllInfo> {
         word,
         product_name,
         version: version_string(bytes, "ProductVersion").or_else(|| version_string(bytes, "FileVersion")),
-        can_host: is_emf || game.host_texts.iter().any(|t| contains_text(bytes, t)),
-        is_emf,
+        can_host: loader.is_some() || game.host_texts.iter().any(|t| contains_text(bytes, t)),
+        loader,
     })
 }
 
@@ -175,18 +184,36 @@ mod tests {
     fn recognises_tools_and_hosts() {
         let alp = inspect(&fake_dll(&["x", "AUTO-LOOT-PLUS.log", "dinput8-chain.ini"], None), &ENSHROUDED).unwrap();
         assert_eq!(alp.word, Some(("auto-loot-plus".into(), WordFrom::Known)));
-        assert!(alp.can_host && !alp.is_emf);
+        assert!(alp.can_host && alp.loader.is_none());
 
         let ens = inspect(&fake_dll(&["enstash Quick Stack placeholders %s"], None), &ENSHROUDED).unwrap();
         assert_eq!(ens.word.unwrap().0, "enstash");
         assert!(!ens.can_host);
 
         let emf = inspect(&fake_dll(&["EMF-LOADER-7d3c9f"], None), &ENSHROUDED).unwrap();
-        assert!(emf.is_emf && emf.can_host);
+        assert!(emf.is_emf() && emf.can_host);
+        // EMF names the mods it knows, and is still EMF
+        let emf2 = inspect(&fake_dll(&["emf_probe", "shroudforge"], None), &ENSHROUDED).unwrap();
+        assert_eq!(emf2.word.unwrap().0, "emf");
 
+        // a DLL that says XHL is a mod; one that also reads the chain file is XHL-Core, the loader
         let plain = inspect(&fake_dll(&[], Some("XHL Core")), &ENSHROUDED).unwrap();
         assert_eq!(plain.word, Some(("xhl-core".into(), WordFrom::VersionInfo)));
         assert_eq!(plain.product_name.as_deref(), Some("XHL Core"));
+        assert!(plain.loader.is_none() && !plain.can_host);
+        let xhl = inspect(&fake_dll(&["dinput8-chain.ini"], Some("XHL-Core")), &ENSHROUDED).unwrap();
+        assert_eq!(xhl.loader.map(|l| l.name), Some("XHL-Core"));
+        assert!(xhl.can_host);
+        // a mod dllchain knows that names XHL-Core (as a loader it works with) stays that mod
+        let alp_xhl = inspect(&fake_dll(&["auto-loot-plus", "dinput8-chain.ini", "XHL-Core"], None), &ENSHROUDED);
+        assert!(alp_xhl.unwrap().loader.is_none());
+
+        // ModLoader Proxy, by its log's name or the ini it reads (both UTF-16 in its DLL)
+        let mut mlp = fake_dll(&[], None);
+        mlp.extend("chainloader.ini".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        let mlp = inspect(&mlp, &ENSHROUDED).unwrap();
+        assert_eq!(mlp.loader.map(|l| l.list), Some("chainloader.ini"));
+        assert_eq!(mlp.word.unwrap().0, "modloader-proxy");
 
         let ms = inspect(&fake_dll(&[], Some("Microsoft Windows Operating System")), &ENSHROUDED).unwrap();
         assert_eq!(ms.word, None);

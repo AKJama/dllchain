@@ -93,6 +93,9 @@ pub struct Record {
     pub chain_created: bool,
     /// The chain file's DLL lines as dllchain last left them, to show what others changed since.
     pub chain: Vec<(RelPath, bool)>,
+    /// The list file those lines and `chain_created` are about, when it is not the game's own chain file: the one
+    /// another loader as the host reads (ModLoader Proxy's `chainloader.ini`).
+    pub chain_file: Option<RelPath>,
 }
 
 /// Where dllchain keeps a copy of a mod's DLL, for repairs.
@@ -189,6 +192,9 @@ impl Record {
         }
         if self.chain_created {
             out.push("chain-created".into());
+        }
+        if let Some(f) = &self.chain_file {
+            out.push(format!("chain-file\t{f}"));
         }
         out.join("\r\n") + "\r\n"
     }
@@ -294,6 +300,7 @@ impl Record {
                 self.chain.push((rel(name)?, on));
             }
             ["chain-created"] => self.chain_created = true,
+            ["chain-file", name] => self.chain_file = Some(rel(name)?),
             [""] => {}
             _ => return Err("unknown line".into()),
         }
@@ -351,6 +358,7 @@ mod tests {
             }],
             chain_created: true,
             chain: vec![(RelPath::of("enstash.dll"), false)],
+            chain_file: Some(RelPath::of("chainloader.ini")),
         }
     }
 
