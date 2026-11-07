@@ -54,6 +54,10 @@ pub struct ModRec {
     /// Files an older version or a hand install left in the mod's folder that dllchain took out (`sha` is what was
     /// there, `backup` its copy); uninstall puts them back.
     pub retired: Vec<FileRec>,
+    /// Files of the mod that were in the game folder already, the same as in its zip, when dllchain listed it (a hand
+    /// install it took over, or a loader another mod brought): dllchain checks them like its own, and uninstall leaves
+    /// them as they were.
+    pub found: Vec<FileRec>,
     /// Folders it created, for removing them again when empty.
     pub dirs: Vec<RelPath>,
 }
@@ -149,6 +153,9 @@ impl Record {
                     out.push(format!("{kind}\t{}\t{}\t{}\t{b}", m.word, f.rel, f.sha));
                 }
             }
+            for f in &m.found {
+                out.push(format!("found\t{}\t{}\t{}", m.word, f.rel, f.sha));
+            }
             for d in &m.dirs {
                 out.push(format!("dir\t{}\t{d}", m.word));
             }
@@ -222,6 +229,7 @@ impl Record {
                     version: None,
                     files: Vec::new(),
                     retired: Vec::new(),
+                    found: Vec::new(),
                     dirs: Vec::new(),
                 });
             }
@@ -256,6 +264,10 @@ impl Record {
                 let backup = own(rel(backup)?)?;
                 let (at, s) = (rel(at)?, sha(s)?);
                 self.mod_mut(w)?.retired.push(FileRec { rel: at, sha: s, backup: Some(backup) });
+            }
+            ["found", w, at, s] => {
+                let (at, s) = (rel(at)?, sha(s)?);
+                self.mod_mut(w)?.found.push(FileRec { rel: at, sha: s, backup: None });
             }
             ["dir", w, at] => {
                 let at = rel(at)?;
@@ -322,6 +334,7 @@ mod tests {
                     sha: "d".repeat(64),
                     backup: Some(RelPath::of("dllchain\\originals\\alp\\mods\\alp\\old.txt")),
                 }],
+                found: vec![FileRec { rel: RelPath::of("mods\\alp\\icon.png"), sha: "e".repeat(64), backup: None }],
                 dirs: vec![RelPath::of("mods\\alp")],
             }],
             chain_created: true,

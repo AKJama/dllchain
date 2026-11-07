@@ -100,7 +100,9 @@ pub struct Game {
     pub emf_texts: &'static [&'static str],
     /// The first tool whose text a DLL contains names it; the order matters (ShroudForge's DLLs contain EML's text).
     pub tools: &'static [Tool],
-    /// Other proxy names: other loaders own them, and a renamed mod must never get one.
+    /// The Windows DLL names the game loads from its own folder before System32 (`host_dll` among them): a loader
+    /// shipped under one of them runs with the game. A renamed mod must never get one, and a mod that ships one of the
+    /// others at its root brings its own loader (`engine` installs it under that name, outside the chain).
     pub proxy_names: &'static [&'static str],
     /// Never written, replaced or deleted, wherever a zip puts them.
     pub protected_extensions: &'static [&'static str],
@@ -153,6 +155,10 @@ pub static ENSHROUDED: Game = Game {
         Tool::named("greeneye", "Greeneye Loader", &["greeneye"]),
         Tool::named("aldrich-modmenu", "Aldrich Mod Menu", &["aldrich"]),
     ],
+    // enshrouded.exe (1.0.x, read 2026-11-07) names dinput8, dbghelp, powrprof, winmm, dxgi, d3d12 and the three
+    // xinput DLLs itself. dbgcore comes with dbghelp (Greeneye's loader for Town Portals uses it); version, winhttp,
+    // d3d11, umpdc and cfgmgr32 come with Windows DLLs the game uses (a guess, from other games' loaders). None of
+    // them is one of Windows' KnownDLLs, which never load from the game folder.
     proxy_names: &[
         "dinput8",
         "dbghelp",
@@ -160,8 +166,13 @@ pub static ENSHROUDED: Game = Game {
         "winmm",
         "powrprof",
         "version",
+        "winhttp",
+        "xinput1_3",
         "xinput1_4",
+        "xinput9_1_0",
         "dxgi",
+        "d3d11",
+        "d3d12",
         "umpdc",
         "cfgmgr32",
     ],
@@ -200,6 +211,13 @@ impl Game {
 
     pub fn package_host(&self, word: &str) -> Option<&'static PackageHost> {
         self.package_hosts.iter().find(|p| p.word == word)
+    }
+
+    /// Whether `name` (`dbgcore.dll`) is a loader name other than the host's: a mod that ships it brings its own loader.
+    pub fn is_own_loader_name(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name.strip_suffix(".dll").is_some_and(|stem| self.proxy_names.contains(&stem))
+            && !name.eq_ignore_ascii_case(self.host_dll)
     }
 
     /// The name players see for a word: the tool's name, or the word itself.

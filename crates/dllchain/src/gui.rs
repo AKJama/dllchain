@@ -1,4 +1,4 @@
-//! dllchain: a small window to install, uninstall and repair dinput8.dll mods. Every change is shown first and only
+//! dllchain: a small window to install, uninstall and repair DLL mods. Every change is shown first and only
 //! made after the player says yes.
 
 #![windows_subsystem = "windows"]
@@ -181,7 +181,7 @@ fn create_controls(main: HWND) {
             ID_GAME,
         ),
         change: button("&Change...", ID_CHANGE),
-        list_label: child(main, "STATIC", "dinput8.dll mods in the game folder:", 0, 0, 0),
+        list_label: child(main, "STATIC", "DLL mods in the game folder:", 0, 0, 0),
         list: child(
             main,
             "SysListView32",
@@ -415,9 +415,7 @@ fn refresh(msg: &str) {
                         text.push_str(&format!("{e}\n"));
                     }
                     if st.rows.is_empty() {
-                        text.push_str(
-                            "No dinput8.dll mods yet. Click Install mod... or drop a mod's zip on this window.\n",
-                        );
+                        text.push_str("No DLL mods yet. Click Install mod... or drop a mod's zip on this window.\n");
                     }
                     for n in &st.notes {
                         text.push_str(&format!("Note: {n}\n"));
@@ -533,7 +531,7 @@ fn act(a: Action) {
             Action::Install(p) => {
                 let src = source::read(p, GAME)?;
                 let what = match src.label.strip_suffix('\\') {
-                    Some(folder) => format!("{} in the folder \"{folder}\"", GAME.host_dll),
+                    Some(folder) => format!("{} in the folder \"{folder}\"", src.dll_name),
                     None => src.label.clone(),
                 };
                 let sha = format!(
@@ -786,7 +784,7 @@ fn downloads() -> Option<Vec<u16>> {
 
 fn pick_mod() -> Option<PathBuf> {
     let filter: Vec<u16> = "Mod zip or DLL (*.zip, *.dll)\0*.zip;*.dll\0".encode_utf16().chain([0]).collect();
-    let title = wide("Pick a mod's zip or its dinput8.dll");
+    let title = wide("Pick a mod's zip or its DLL");
     let mut buf = vec![0u16; 4096];
     let start = downloads();
     // SAFETY: OPENFILENAMEW is plain data; every pointer in it outlives the call.
@@ -870,7 +868,7 @@ fn on_command(id: i32, code: u32) {
             message(
                 "About dllchain",
                 &format!(
-                    "dllchain {}\nInstalls several dinput8.dll mods side by side, and takes them out again.\n\n\
+                    "dllchain {}\nInstalls DLL mods side by side (dinput8.dll mods in one chain), and takes them out again.\n\n\
                      https://github.com/AKJama/dllchain\nMIT licence.",
                     update::THIS
                 ),
@@ -1205,7 +1203,7 @@ fn main() {
             hIconSm: null_mut(),
         };
         RegisterClassExW(&wc);
-        let title = wide(&format!("dllchain - {} dinput8.dll mods", GAME.name));
+        let title = wide(&format!("dllchain - {} DLL mods", GAME.name));
         let (help, bar) = (CreatePopupMenu(), CreateMenu());
         let (check, about, help_title) = (wide("Check for &updates..."), wide("&About dllchain"), wide("&Help"));
         AppendMenuW(help, MF_STRING, ID_CHECK_UPDATE as usize, check.as_ptr());

@@ -1,6 +1,7 @@
 # dllchain
 
-Installs several `dinput8.dll` mods for one game side by side, and takes them out again.
+Installs several DLL mods for one game side by side, and takes them out again.
+Most ship as `dinput8.dll` and go into one chain; a mod that brings its own loader under another name (such as `dbgcore.dll` or `powrprof.dll`) is installed as it is, next to them.
 
 ## First time? Step by step
 
@@ -13,8 +14,9 @@ Installs several `dinput8.dll` mods for one game side by side, and takes them ou
    `dllchain-cli.exe` is the same for the command line; you don't need it.
 4. Click **Install mod...** and pick a mod's zip as you downloaded it (no need to unzip it).
    dllchain says what it will do; press **Install**.
-5. Do the same for each other `dinput8.dll` mod.
+5. Do the same for each other mod.
    A `dinput8.dll` you already put in by hand is kept and joins the chain.
+   A mod with its own loader that you already put in by hand is taken on as it is when you install its zip, and Uninstall leaves it as it was.
 6. There is no ini to edit: dllchain writes `dinput8-chain.ini` itself.
 7. Start Steam and the game.
    Each mod's own log says whether it loaded.
@@ -33,10 +35,12 @@ Another game is one more entry in `crates/chainkit/src/game.rs`.
 Download the zip from the [releases](https://github.com/AKJama/dllchain/releases), unpack it anywhere, and run `dllchain.exe`.
 Close the game and Steam first; dllchain changes nothing while either runs.
 
-- **Install mod...** (or drop a mod's `.zip` or `dinput8.dll` on the window) adds a mod.
-  For a mod you already unpacked, pick its `dinput8.dll`: the files next to it (such as its `mods\` folder) are installed with it.
+- **Install mod...** (or drop a mod's `.zip` or DLL on the window) adds a mod.
+  For a mod you already unpacked, pick its `dinput8.dll` (or its own loader, such as `powrprof.dll`): the files next to it (such as its `mods\` folder) are installed with it.
   A folder that also holds programs, archives, pictures or documents, such as Downloads itself, is refused, so unpack each mod into a folder of its own.
-  Licence, checksum and read-me files next to the mod's `dinput8.dll` (such as `SHA256SUMS.txt`) are for you, not the game, so they are never copied into the game folder.
+  Licence, checksum and read-me files next to the mod's DLL or at the top of its zip (such as `SHA256SUMS.txt`) are for you, not the game, so they are never copied into the game folder.
+  When the zip carries a checksum list (`SHA256.json`, `SHA256SUMS` or `SHA256SUMS.txt`), every file dllchain installs is checked against it first, and a file that does not match, or is listed but missing, stops the install.
+  A zip with a `client\` and a `server\` folder installs only `client\`, and says so; `server\` is for a dedicated server.
   When the mod is also a script package for the [Enshrouded Mod Loader (EML)](https://brabb3l.github.io/kfc-parser/eml/usage.html) (it ships `mods\<name>\mod.json`) and EML is not installed, dllchain says so, with a link to EML's page.
   It installs the mod anyway and never downloads EML itself.
 - **Uninstall** or **Uninstall all** take mods out again.
@@ -66,7 +70,7 @@ The same actions are on the command line in `dllchain-cli.exe`:
 
 ```
 dllchain-cli status
-dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
+dllchain-cli install <mod.zip | mod's DLL> [--yes] [--allow-replace]
 dllchain-cli uninstall <name> | --all [--delete-logs] [--yes]
 dllchain-cli rename <name> <new name> [--yes]
 dllchain-cli repair [--yes]
@@ -89,6 +93,13 @@ Without `--yes` it only shows what it would do.
   ShroudForge next to another loader's `dbghelp.dll` (EML's own) is refused with an explanation, as the two cannot run together.
 - A file an older version of a mod left behind and the new version no longer reads (such as enstash's `enstash-data.txt` once `enstash-data.dat` is there) is taken out on install, kept in `dllchain\originals\`, and put back on uninstall.
   Your own files next to a mod (its marks, settings, `.off` switches, backups and logs) are never touched.
+- A mod that brings its own loader under another name the game loads (Town Portals' `dbgcore.dll`, Greeneye's loader; Auto Doors' `powrprof.dll`) keeps that name and its folders, and stays out of the chain: the game loads it by itself.
+  Mods that use the same loader share it, and it goes with the last of them.
+  A newer build of the same loader replaces an older one (the older one is kept in `dllchain\originals\` and comes back on uninstall); an older or equal one leaves yours in place.
+  A different program under that name, such as EML's `dbghelp.dll`, is never replaced: the install is refused with an explanation.
+  So is a loader that would stop ShroudForge's folders from loading.
+  The files such a loader and its mods write while they run (`greeneye\loader.log`, `greeneye\town-portal\town-portal.ini`) count as files the mod made.
+- Files that were already there, the same as in the zip (a mod you put in by hand), are listed but stay yours: Uninstall leaves them, so the folder is as it was before.
 - A `dinput8.dll` that was already there, put in by hand or by another tool, is left as it is until you install another mod; then it joins the chain, and uninstalling gives it back.
 - A file it replaces is copied to `dllchain\originals\` first, and put back on uninstall.
 - What it installed is listed in `dllchain\record.txt`, and each run is logged in `dllchain\installer.log`.
@@ -99,7 +110,7 @@ Without `--yes` it only shows what it would do.
 
 dllchain sends nothing anywhere, except when you check for updates: then it asks GitHub for the newest version number, and nothing about your PC or game goes with it.
 
-It never writes programs (`.exe`), game data, Steam's files or another loader's own files, and never writes outside the game folder (apart from that one save copy).
+It never writes programs (`.exe`), game data, Steam's files or another loader's own files (a newer build of the loader a mod brings aside, with a copy kept), and never writes outside the game folder (apart from that one save copy).
 Uninstall removes only what dllchain created, and gives back the rest byte for byte.
 The files a mod made while it ran go only when you ask (the tick box, or `--delete-logs`).
 If a run fails or is cut off, everything it changed is undone, from `dllchain\journal.txt`, before anything else happens.
@@ -119,6 +130,7 @@ gh attestation verify dllchain.exe --repo AKJama/dllchain
 
 dllchain also shows the SHA-256 of every mod you install.
 Compare it with the one the mod's author publishes.
+When the mod's zip has its own checksum list, dllchain checks the files against it as well.
 
 ## Build
 

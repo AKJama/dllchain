@@ -15,6 +15,7 @@ pub mod dllinfo;
 pub mod engine;
 pub mod game;
 pub mod hash;
+pub mod json;
 pub mod paths;
 pub mod procs;
 pub mod record;

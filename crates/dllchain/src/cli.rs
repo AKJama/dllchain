@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-dllchain-cli: installs several dinput8.dll mods side by side, and takes them out again.
+dllchain-cli: installs DLL mods side by side (dinput8.dll mods in one chain), and takes them out again.
 
   dllchain-cli status
-  dllchain-cli install <mod.zip | dinput8.dll> [--yes] [--allow-replace]
+  dllchain-cli install <mod.zip | mod's DLL> [--yes] [--allow-replace]
   dllchain-cli uninstall <name> | --all [--delete-logs] [--yes]
   dllchain-cli rename <name> <new name> [--yes]   (\"\" gives the mod its own name back)
   dllchain-cli repair [--yes]
@@ -165,7 +165,7 @@ fn apply(a: &Args, ctx: &Ctx, plan: &Plan) -> Result<()> {
 fn print_status(ctx: &Ctx) -> Result<()> {
     let st = status(ctx)?;
     if st.rows.is_empty() {
-        println!("No dinput8.dll mods.");
+        println!("No DLL mods.");
     }
     for r in &st.rows {
         let sha = r.sha.as_deref().map_or("missing".to_string(), |s| short(s).to_string());

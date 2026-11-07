@@ -10,7 +10,7 @@ use chainkit::engine::{
 use chainkit::game::ENSHROUDED;
 use chainkit::hash::sha256_hex;
 use chainkit::paths::RelPath;
-use chainkit::source::ModSource;
+use chainkit::source::{About, ModSource};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -88,11 +88,14 @@ fn src(label: &str, dll: Vec<u8>, files: &[(&str, &[u8])]) -> ModSource {
         label: label.into(),
         sha256: sha256_hex(&all),
         word_hint: chainkit::source::word_hint(label.trim_end_matches(".zip")),
+        dll_name: "dinput8.dll".into(),
         dll,
         files: files.iter().map(|(n, b)| (RelPath::parse(n).unwrap(), b.to_vec())).collect(),
         ignored: Vec::new(),
         extras: Vec::new(),
         from_url: None,
+        about: None,
+        notes: Vec::new(),
     }
 }
 
@@ -1500,4 +1503,258 @@ fn under_shroudforge_what_the_mod_made_in_its_folder_goes_with_the_folder() {
     // ShroudForge and its packages are untouched
     assert!(dir.join(r"mods\sf-survival\mod.json").exists() && dir.join(r"shroudforge\settings.json").exists());
     clean(&dir);
+}
+
+// Mods that bring their own loader under another name the game loads (Greeneye's dbgcore.dll for Town Portals, Auto
+// Doors' powrprof.dll): installed as they are, outside the chain.
+
+/// Greeneye's loader, `version` as its version information has it.
+fn greeneye(version: &str) -> Vec<u8> {
+    fake_dll_with(&["greeneye"], &[("ProductName", "Greeneye Loader"), ("ProductVersion", version)])
+}
+
+/// A mod whose zip ships `loader` (`dbgcore.dll`) next to its own folder, with what its `mod.json` says.
+fn own(label: &str, loader: &str, dll: Vec<u8>, files: &[(&str, &[u8])], id: Option<&str>) -> ModSource {
+    let mut s = src(label, dll, files);
+    s.dll_name = loader.into();
+    s.about = id.map(|i| About { id: Some(i.into()), name: Some(format!("Mod {i}")), version: Some("1.0.12".into()) });
+    s
+}
+
+fn town_portal(loader: Vec<u8>) -> ModSource {
+    own(
+        "Town Portals 1.0.12.zip",
+        "dbgcore.dll",
+        loader,
+        &[
+            (r"greeneye\town-portal\town-portal.dll", b"tp"),
+            (r"greeneye\town-portal\mod.json", b"{}"),
+            (r"greeneye\town-portal\voice\en\a.wav", b"en"),
+            (r"greeneye\town-portal\voice\de\a.wav", b"de"),
+        ],
+        Some("town-portal"),
+    )
+}
+
+fn auto_doors() -> ModSource {
+    own(
+        "Auto Doors 1.1.0.zip",
+        "powrprof.dll",
+        fake_dll_with(&[], &[("ProductName", "Auto Doors"), ("ProductVersion", "1.1.0")]),
+        &[(r"AutoDoors\bin\ad_core.dll", b"core"), (r"AutoDoors\README.txt", b"r")],
+        None,
+    )
+}
+
+/// A game with ALP hosting another mod, as most players have it.
+fn chained_game(name: &str) -> (PathBuf, Ctx) {
+    let dir = game(name);
+    let c = ctx(&dir);
+    install(&c, &src("AutoLootPlus.zip", alp(), &[(r"mods\auto-loot-plus\mod.lua", b"m")]));
+    install(&c, &src("xhl.zip", xhl(), &[]));
+    (dir, c)
+}
+
+#[test]
+fn a_mod_with_its_own_loader_installs_beside_the_chain_and_goes_again() {
+    let (dir, c) = chained_game("own-fresh");
+    let before = snapshot(&dir);
+    let chain_before = chain(&dir);
+    let p = install(&c, &town_portal(greeneye("1.2.2")));
+    clean(&dir);
+    assert!(p.summary.iter().any(|l| l.contains("Adds dbgcore.dll, the loader")), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.2.2")));
+    assert_eq!(read(&dir, r"greeneye\town-portal\voice\de\a.wav"), Some(b"de".to_vec()));
+    // the chain is as it was: the game loads dbgcore.dll by itself
+    assert_eq!(chain(&dir), chain_before);
+    assert_eq!(read(&dir, "dinput8.dll"), Some(alp()));
+    install(&c, &auto_doors());
+    assert_eq!(chain(&dir), chain_before);
+    let st = status(&c).unwrap();
+    let tp = row(&st, "town-portal");
+    assert_eq!((tp.file.as_str(), tp.name.as_str()), ("dbgcore.dll", "Mod town-portal"));
+    assert_eq!(tp.role, "its own loader; the game loads it");
+    assert_eq!(tp.version.as_deref(), Some("1.0.12"));
+    // Auto Doors names itself in its DLL
+    assert_eq!(row(&st, "auto-doors").name, "Auto Doors");
+    assert!(st.repair.is_empty(), "{:?}", st.repair);
+    assert!(plan_repair(&c).unwrap().is_empty());
+    // installing again only checks
+    let p = plan_install(&c, &town_portal(greeneye("1.2.2"))).unwrap();
+    assert!(p.is_empty(), "{:?} {:?}", p.summary, p.files);
+    let p = plan_install(&c, &src("xhl.zip", xhl(), &[])).unwrap();
+    assert!(p.is_empty(), "{:?} {:?}", p.summary, p.files);
+    // what the loader and the mod write while they run is theirs
+    std::fs::write(dir.join(r"greeneye\loader.log"), b"log").unwrap();
+    std::fs::write(dir.join(r"greeneye\town-portal\town-portal.ini"), b"ini").unwrap();
+    std::fs::create_dir_all(dir.join(r"AutoDoors\logs")).unwrap();
+    std::fs::write(dir.join(r"AutoDoors\logs\loader.log"), b"log").unwrap();
+    let p = plan_uninstall(&c, Some("town-portal")).unwrap();
+    assert_eq!(made_names(&p), [r"greeneye\loader.log", r"greeneye\town-portal\town-portal.ini"]);
+    let p = plan_uninstall(&c, Some("auto-doors")).unwrap();
+    assert_eq!(made_names(&p), [r"AutoDoors\logs\"]);
+    // kept without the tick, gone with it
+    run(&c, plan_uninstall(&c, Some("town-portal")));
+    assert!(!dir.join("dbgcore.dll").exists());
+    assert_eq!(read(&dir, r"greeneye\loader.log"), Some(b"log".to_vec()));
+    run(&c, plan_undo(&c));
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.2.2")));
+    run(&c, plan_uninstall_with(&c, Some("town-portal"), true));
+    run(&c, plan_uninstall_with(&c, Some("auto-doors"), true));
+    clean(&dir);
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+    assert_eq!(chain(&dir), chain_before);
+}
+
+#[test]
+fn a_hand_installed_mod_is_taken_on_and_given_back_as_it_was() {
+    let (dir, c) = chained_game("own-adopt");
+    // Town Portals put there by hand, with only its English voices, and Auto Doors complete
+    std::fs::write(dir.join("dbgcore.dll"), greeneye("1.2.2")).unwrap();
+    for (rel, b) in [
+        (r"greeneye\town-portal\town-portal.dll", &b"tp"[..]),
+        (r"greeneye\town-portal\mod.json", b"{}"),
+        (r"greeneye\town-portal\voice\en\a.wav", b"en"),
+        (r"greeneye\town-portal\town-portal.ini", b"my settings"),
+        (r"greeneye\loader.log", b"log"),
+    ] {
+        std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(rel), b).unwrap();
+    }
+    let ad = auto_doors();
+    std::fs::write(dir.join("powrprof.dll"), &ad.dll).unwrap();
+    for (rel, b) in &ad.files {
+        std::fs::create_dir_all(dir.join(rel.as_str()).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(rel.as_str()), b).unwrap();
+    }
+    let before = snapshot(&dir);
+    let p = install(&c, &town_portal(greeneye("1.2.2")));
+    assert!(p.summary[0].contains("put there by hand"), "{:?}", p.summary);
+    assert!(p.summary.iter().any(|l| l.starts_with("Finds dbgcore.dll, its loader")), "{:?}", p.summary);
+    assert!(p.summary.iter().any(|l| l.starts_with("Adds 1 more file")), "{:?}", p.summary);
+    assert!(p.summary.iter().any(|l| l.starts_with("Finds 3 of its files")), "{:?}", p.summary);
+    assert!(p.replaces.is_empty());
+    let p = install(&c, &ad);
+    assert!(p.files.is_empty(), "{:?}", p.files);
+    assert!(!p.summary.iter().any(|l| l.contains("another tool moved")), "{:?}", p.summary);
+    let st = status(&c).unwrap();
+    let details = &row(&st, "town-portal").details;
+    assert!(details.iter().any(|(k, v)| k == "Already there" && v.starts_with("4 files")), "{details:?}");
+    // Uninstall takes away only what dllchain added; what was there stays as it was
+    let p = run(&c, plan_uninstall(&c, Some("town-portal")));
+    let line = "Leaves 4 files that were there before dllchain listed it.";
+    assert!(p.summary.iter().any(|l| l == line), "{:?}", p.summary);
+    run(&c, plan_uninstall(&c, Some("auto-doors")));
+    clean(&dir);
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+    // and Undo takes the uninstall back
+    run(&c, plan_undo(&c));
+    assert!(row(&status(&c).unwrap(), "auto-doors").installed);
+}
+
+#[test]
+fn mods_on_one_loader_share_it_and_the_last_one_takes_it_out() {
+    let (dir, c) = chained_game("own-shared");
+    let before = snapshot(&dir);
+    install(&c, &town_portal(greeneye("1.2.2")));
+    let other =
+        own("Other.zip", "dbgcore.dll", greeneye("1.2.2"), &[(r"greeneye\other\other.dll", b"o")], Some("other"));
+    let p = install(&c, &other);
+    let line = "Shares dbgcore.dll, its loader, with Mod town-portal.";
+    assert!(p.summary.iter().any(|l| l == line), "{:?}", p.summary);
+    // the first one out leaves the loader to the other
+    let p = run(&c, plan_uninstall(&c, Some("town-portal")));
+    let line = "Leaves dbgcore.dll, which Mod other uses too.";
+    assert!(p.summary.iter().any(|l| l == line), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.2.2")));
+    assert!(plan_repair(&c).unwrap().is_empty());
+    run(&c, plan_uninstall(&c, Some("other")));
+    clean(&dir);
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+}
+
+#[test]
+fn a_newer_loader_of_the_same_kind_replaces_an_older_one_and_comes_back_out() {
+    let dir = game("own-newer");
+    std::fs::write(dir.join("dbgcore.dll"), greeneye("1.2.0")).unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let p = install(&c, &town_portal(greeneye("1.2.2")));
+    let line = "Updates dbgcore.dll, the Greeneye Loader in your game, from 1.2.0 to 1.2.2";
+    assert!(p.summary.iter().any(|l| l.starts_with(line)), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.2.2")));
+    assert_eq!(read(&dir, r"dllchain\originals\town-portal\dbgcore.dll"), Some(greeneye("1.2.0")));
+    run(&c, plan_uninstall(&c, Some("town-portal")));
+    clean(&dir);
+    assert_eq!(snapshot(&dir), before);
+
+    // an older one in the zip leaves the newer one there
+    std::fs::write(dir.join("dbgcore.dll"), greeneye("1.3.0")).unwrap();
+    let p = install(&c, &town_portal(greeneye("1.2.2")));
+    assert!(p.notes.iter().any(|n| n.contains("the same or newer")), "{:?}", p.notes);
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.3.0")));
+    run(&c, plan_uninstall(&c, Some("town-portal")));
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.3.0")));
+}
+
+#[test]
+fn another_loader_under_that_name_is_refused() {
+    let dir = game("own-other");
+    // EML's dbghelp.dll, and someone else's dbgcore.dll
+    std::fs::write(dir.join("dbghelp.dll"), fake_dll(&["EML_LOG_FILE_PATH"], None)).unwrap();
+    std::fs::write(dir.join("dbgcore.dll"), fake_dll(&[], Some("Something Else"))).unwrap();
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let e = plan_install(&c, &town_portal(greeneye("1.2.2"))).unwrap_err();
+    assert!(e.0.contains("dbgcore.dll in your game is Something Else, not the loader"), "{}", e.0);
+    let e = plan_install(&c, &own("x.zip", "dbghelp.dll", greeneye("9.0"), &[], Some("x"))).unwrap_err();
+    assert!(e.0.contains("dbghelp.dll in your game is EML"), "{}", e.0);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn a_loader_that_stops_shroudforges_folders_is_refused_with_it() {
+    let dir = game("own-shroudforge");
+    shroudforge(&dir);
+    let before = snapshot(&dir);
+    let c = ctx(&dir);
+    let strict = fake_dll(&["EML_LOG_FILE_PATH"], Some("Some EML build"));
+    let e = plan_install(&c, &own("x.zip", "powrprof.dll", strict, &[], Some("x"))).unwrap_err();
+    assert!(e.0.contains("cannot run with ShroudForge"), "{}", e.0);
+    assert_eq!(snapshot(&dir), before);
+    // one that does not is fine next to it, and leaves ShroudForge alone
+    install(&c, &auto_doors());
+    run(&c, plan_uninstall(&c, Some("auto-doors")));
+    assert_eq!(without_own(&snapshot(&dir)), without_own(&before));
+}
+
+#[test]
+fn a_loader_another_mod_may_need_stays() {
+    let dir = game("own-foreign");
+    let c = ctx(&dir);
+    install(&c, &town_portal(greeneye("1.2.2")));
+    // a Greeneye mod put there by hand
+    std::fs::create_dir_all(dir.join(r"greeneye\hand")).unwrap();
+    std::fs::write(dir.join(r"greeneye\hand\hand.dll"), b"h").unwrap();
+    let p = run(&c, plan_uninstall(&c, Some("town-portal")));
+    assert!(p.summary.iter().any(|l| l.starts_with(r"Leaves dbgcore.dll: greeneye\hand\hand.dll")), "{:?}", p.summary);
+    assert_eq!(read(&dir, "dbgcore.dll"), Some(greeneye("1.2.2")));
+    assert!(!dir.join(r"greeneye\town-portal").exists());
+    assert!(dir.join(r"greeneye\hand\hand.dll").exists());
+}
+
+#[test]
+fn a_loader_mod_and_a_chained_mod_keep_their_names_apart() {
+    let (dir, c) = chained_game("own-names");
+    let before = snapshot(&dir);
+    let e = plan_install(&c, &own("alp.zip", "dbgcore.dll", greeneye("1.0"), &[], Some("auto-loot-plus"))).unwrap_err();
+    assert!(e.0.contains("is on dllchain's list as a mod that ships as dinput8.dll"), "{}", e.0);
+    assert_eq!(snapshot(&dir), before);
+    install(&c, &town_portal(greeneye("1.2.2")));
+    let mut moved = town_portal(greeneye("1.2.2"));
+    moved.dll_name = "winmm.dll".into();
+    let e = plan_install(&c, &moved).unwrap_err();
+    assert!(e.0.contains("used dbgcore.dll before and now brings winmm.dll"), "{}", e.0);
+    let e = plan_install(&c, &src("town-portal.zip", fake_dll(&[], None), &[])).unwrap_err();
+    assert!(e.0.contains("is on dllchain's list as a mod that brings its own loader (dbgcore.dll)"), "{}", e.0);
 }
