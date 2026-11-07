@@ -28,20 +28,15 @@ pub struct DllInfo {
     pub loader: Option<&'static Loader>,
 }
 
-impl DllInfo {
-    pub fn is_emf(&self) -> bool {
-        self.loader.is_some_and(|l| l.word == "emf")
-    }
-}
-
 /// Checks that `bytes` is a 64-bit Windows DLL and says what it is.
 pub fn inspect(bytes: &[u8], game: &Game) -> Result<DllInfo> {
     check_x64_dll(bytes)?;
     let product_name = version_string(bytes, "ProductName").or_else(|| version_string(bytes, "FileDescription"));
     let known = game.tools.iter().find(|t| t.texts.iter().any(|x| contains_text(bytes, x)));
     let loader = game.loaders.iter().find(|l| {
-        l.texts.iter().any(|group| group.iter().all(|t| contains_text(bytes, t)))
-            && (l.own_texts || known.is_none_or(|t| t.word == l.word))
+        // the free test first: a known tool's DLL is scanned only for loaders whose texts are their own
+        (l.own_texts || known.is_none_or(|t| t.word == l.word))
+            && l.texts.iter().any(|group| group.iter().all(|t| contains_text(bytes, t)))
     });
     let word = if let Some(l) = loader {
         Some((l.word.to_string(), WordFrom::Known))
@@ -191,7 +186,7 @@ mod tests {
         assert!(!ens.can_host);
 
         let emf = inspect(&fake_dll(&["EMF-LOADER-7d3c9f"], None), &ENSHROUDED).unwrap();
-        assert!(emf.is_emf() && emf.can_host);
+        assert!(emf.loader.is_some_and(|l| l.word == "emf") && emf.can_host);
         // EMF names the mods it knows, and is still EMF
         let emf2 = inspect(&fake_dll(&["emf_probe", "shroudforge"], None), &ENSHROUDED).unwrap();
         assert_eq!(emf2.word.unwrap().0, "emf");

@@ -285,21 +285,39 @@ impl Game {
         tool.or_else(loader).map_or_else(|| word.to_string(), str::to_string)
     }
 
-    /// The list files of the game's host: its own chain file, and the loaders' (each once).
-    pub fn list_files(&self) -> Vec<&'static str> {
-        let mut out = vec![self.chain_file];
-        for l in self.loaders {
-            if !out.iter().any(|f| f.eq_ignore_ascii_case(l.list)) {
-                out.push(l.list);
-            }
-        }
-        out
+    /// Whether `name` is a file the host reads its guests from: the chain file, or a loader's list.
+    pub fn is_list_file(&self, name: &str) -> bool {
+        std::iter::once(self.chain_file)
+            .chain(self.loaders.iter().map(|l| l.list))
+            .any(|f| f.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether `stem` is the host's name with another number (`dinput9`, `dinput10`): the names Multi DLL Installer
+    /// gives the mods it renames, which dllchain leaves to it.
+    pub fn renamed_by_others(&self, stem: &str) -> bool {
+        let host = self.host_dll.strip_suffix(".dll").unwrap_or(self.host_dll);
+        let base = host.trim_end_matches(|c: char| c.is_ascii_digit());
+        let number = stem.get(base.len()..).filter(|_| stem.is_char_boundary(base.len()));
+        stem.get(..base.len()).is_some_and(|b| b.eq_ignore_ascii_case(base))
+            && number.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            && !stem.eq_ignore_ascii_case(host)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_dll_installer_names_are_the_hosts_with_another_number() {
+        for s in ["dinput9", "DInput10", "dinput41", "dinput0"] {
+            assert!(ENSHROUDED.renamed_by_others(s), "{s}");
+        }
+        for s in ["dinput8", "dinput", "dinput9x", "dinput-9", "xinput9", "dinpu", ""] {
+            assert!(!ENSHROUDED.renamed_by_others(s), "{s}");
+        }
+        assert!(ENSHROUDED.is_list_file("ChainLoader.ini") && !ENSHROUDED.is_list_file("mods.ini"));
+    }
 
     #[test]
     fn an_eml_package_is_mods_id_mod_json() {

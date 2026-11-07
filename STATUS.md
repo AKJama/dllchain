@@ -32,8 +32,24 @@ dllchain now keeps everything it does not own in another tool's list file, and a
 ### Checks
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`: clean.
-- `cargo test --release`: 126 tests (45 chainkit lib, 70 engine, 6 window, 5 command line), up from 115.
+- `cargo test --release`: 129 tests (46 chainkit lib, 72 engine, 6 window, 5 command line), up from 115; rerun after both reviews' fixes.
   New: round trips of six other tools' file shapes and ModLoader Proxy's ini; install, update, uninstall and undo with XHL-Core, EMF (with `[EMF]` and `[Options]`) and ModLoader Proxy (folder loading on and off), each ending byte for byte as it started; ModLoader Proxy without its ini, and put in by hand over a chain; a forward target removed (XHL `Forward`, ModLoader Proxy `ForwardTo`); ShroudForge with a forward; Multi DLL Installer names.
+
+### Reviews
+
+- `/code-review medium`: 10 findings, 7 fixed.
+  - Fixed: a loader an older dllchain installed as a mod at `dinput8.dll` would have been renamed away (it now stays the host); XHL-Core was found by the bare text "XHL" (now its name, with the chain file); ModLoader Proxy by "chainloader.ini" alone, even in a known mod (now both its texts); the host line named a `dinput8.dll` that starts no others; the Multi DLL Installer note counted dllchain's own files; a forward outside the game folder was called missing; dllchain's own switched-off mod whose file went missing lost its row.
+  - Not fixed: the old list's "dllchain made it" is forgotten when the user's own line keeps that file after a move (the file then stays, with the user's line, which is the safer side); a forward in the old list is not checked in the same run that moves the lines (rare); `Scan.loader` and `Plan.list`'s format as derived state (done in the simplify pass).
+- `/simplify`: 4 agents, 25 findings, 14 after dedup, 8 fixed.
+  - Fixed: one `Game::renamed_by_others` for Multi DLL Installer names, used by layout and status (status now lists the folder once instead of checking 32 names, and has no upper bound); `Scan::loader()` derived from the host instead of a stored copy; `Plan.list` holds only the file, its format comes from `Ctx::format_of`; `DllInfo::is_emf` removed; `say_forward_gone` names the host the way status does; `Game::list_files` became `is_list_file`; the status row match has one "switched off" arm; `inspect` checks the free condition before scanning for a loader's texts.
+  - Skipped (deeper refactors, later items below): a `ListFile { name, format }` shared by `Game` and `Loader`; loaders as `Tool`s with an optional loader part instead of two tables and `own_texts`; one host-kind value in `Status` with its sentence, instead of `package_host`, `loader` and `host` plus the window rebuilding that sentence; the refused-line wording as a property of `Format`; `ChainFile::new`/`decode`/`Default` kept for tests; `counted` in one pass; the tests' `load_list` next to `chain`.
+
+### Later
+
+- A `ListFile { name, format }` for the chain file and each loader's list, so `format_of` and the scattered defaults go.
+- Loaders as entries of `tools` with an optional loader part, one ordered first-match pass, no `own_texts`.
+- One host kind in `Status` with its "a mod you install goes to ..." sentence, used by the window and the command line.
+- A mod that bundles ModLoader Proxy under another proxy name with its own `chainloader.ini`, and ModLoader Proxy as a host under a name other than `dinput8.dll`.
 
 ## 2026-11-07: mods that bring their own loader (branch wip/own-loader-mods)
 
